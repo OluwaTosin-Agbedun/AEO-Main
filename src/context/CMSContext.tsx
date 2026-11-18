@@ -889,7 +889,9 @@ export function CMSProvider({ children }: { children: ReactNode }) {
       await runTransaction(db, async (transaction) => {
         const docRef = doc(db, 'cms', 'dcm_publications');
         const sfDoc = await transaction.get(docRef);
-        let current: DcmPublication[] = sfDoc.exists() && Array.isArray(sfDoc.data()?.items) ? sfDoc.data()!.items : [];
+        let current: DcmPublication[] = sfDoc.exists() && Array.isArray(sfDoc.data()?.items)
+          ? sfDoc.data()!.items
+          : INITIAL_DCM_PUBLICATIONS;
 
         const exists = current.some(p => p.id === pub.id);
         nextDcm = exists ? current.map(p => p.id === pub.id ? sanitizedPub : p) : [sanitizedPub, ...current];
@@ -897,7 +899,11 @@ export function CMSProvider({ children }: { children: ReactNode }) {
           nextDcm = nextDcm.map(p => p.id === pub.id ? p : { ...p, isLatest: false });
         }
 
-        nextDcm.sort((a, b) => new Date(b.periodEnd).getTime() - new Date(a.periodEnd).getTime());
+        nextDcm.sort((a, b) => {
+          const tB = new Date(b.periodEnd || b.periodStart).getTime() || 0;
+          const tA = new Date(a.periodEnd || a.periodStart).getTime() || 0;
+          return tB - tA;
+        });
         transaction.set(docRef, removeUndefined({ items: nextDcm, updatedAt: Date.now() }));
       });
 
@@ -1266,6 +1272,10 @@ export function CMSProvider({ children }: { children: ReactNode }) {
       const teamSnap = await getDoc(doc(db, 'cms', 'team'));
       if (teamSnap.exists() && Array.isArray(teamSnap.data()?.items)) {
         setTeam(teamSnap.data()?.items);
+      }
+      const dcmSnap = await getDoc(doc(db, 'cms', 'dcm_publications'));
+      if (dcmSnap.exists() && Array.isArray(dcmSnap.data()?.items)) {
+        setDcmPublications(dcmSnap.data()?.items);
       }
     } catch (e) {
       console.warn('Error refreshing cloud data:', e);

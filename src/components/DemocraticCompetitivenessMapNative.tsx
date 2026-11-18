@@ -13,7 +13,7 @@ import {
   NIGERIA_37_JURISDICTIONS,
   MONTH_NAMES 
 } from '../types/dcm';
-import { compareDcmPublications, sortDcmChronologically } from '../utils/dcmComparison';
+import { compareDcmPublications, getPublishedDcmSorted, sortDcmChronologically } from '../utils/dcmComparison';
 import { DcmMap } from './DcmMap';
 import { DcmTimeline } from './DcmTimeline';
 import { DcmBriefRequestModal } from './DcmBriefRequestModal';
@@ -22,24 +22,26 @@ import { INITIAL_DCM_PUBLICATIONS } from '../data/dcmInitialData';
 export const DemocraticCompetitivenessMapNative: React.FC = () => {
   const { dcmPublications } = useCMS();
 
-  // Use CMS publications if available, otherwise fallback to initial seed
+  // Use active CMS publications sorted chronologically, falling back to initial seed
   const publications: DcmPublication[] = useMemo(() => {
-    if (dcmPublications && dcmPublications.length > 0) {
-      return dcmPublications.filter(p => p.status === 'published');
+    const cmsActive = getPublishedDcmSorted(dcmPublications);
+    if (cmsActive.length > 0) {
+      return cmsActive;
     }
-    return INITIAL_DCM_PUBLICATIONS.filter(p => p.status === 'published');
+    return getPublishedDcmSorted(INITIAL_DCM_PUBLICATIONS);
   }, [dcmPublications]);
 
   // Chronologically sorted (descending for latest-first selection)
   const sortedDesc = useMemo(() => {
-    return [...publications].sort((a, b) => new Date(b.periodEnd).getTime() - new Date(a.periodEnd).getTime());
+    return sortDcmChronologically(publications).reverse();
   }, [publications]);
 
   // Default publication: latest published
   const [selectedPubId, setSelectedPubId] = useState<string>(() => {
-    const latest = sortedDesc.find(p => p.isLatest) || sortedDesc[0];
+    const latest = sortedDesc[0];
     return latest?.id || INITIAL_DCM_PUBLICATIONS[0].id;
   });
+  const [hasManualSelection, setHasManualSelection] = useState<boolean>(false);
 
   // Selected state on map (null = "All States" default)
   const [selectedStateCode, setSelectedStateCode] = useState<string | null>(null);
@@ -55,12 +57,15 @@ export const DemocraticCompetitivenessMapNative: React.FC = () => {
     return publications.find(p => p.id === selectedPubId) || sortedDesc[0] || INITIAL_DCM_PUBLICATIONS[0];
   }, [publications, selectedPubId, sortedDesc]);
 
-  // When publications load or change, ensure valid selection
+  // Automatically sync to the newest published map on live updates unless user manually chose a past period
   useEffect(() => {
-    if (!publications.some(p => p.id === selectedPubId) && sortedDesc.length > 0) {
-      setSelectedPubId(sortedDesc[0].id);
+    if (sortedDesc.length === 0) return;
+    if (!hasManualSelection || !publications.some(p => p.id === selectedPubId)) {
+      if (selectedPubId !== sortedDesc[0].id) {
+        setSelectedPubId(sortedDesc[0].id);
+      }
     }
-  }, [publications, selectedPubId, sortedDesc]);
+  }, [publications, selectedPubId, sortedDesc, hasManualSelection]);
 
   // Comparison against immediately preceding publication
   const comparison = useMemo(() => {
@@ -101,6 +106,7 @@ export const DemocraticCompetitivenessMapNative: React.FC = () => {
   const handleYearChange = (year: number) => {
     const pubInYear = publications.find(p => p.year === year);
     if (pubInYear) {
+      setHasManualSelection(true);
       setSelectedPubId(pubInYear.id);
     }
   };
@@ -108,11 +114,13 @@ export const DemocraticCompetitivenessMapNative: React.FC = () => {
   const handleMonthChange = (month: number) => {
     const pubInMonth = publications.find(p => p.year === activePublication.year && p.month === month);
     if (pubInMonth) {
+      setHasManualSelection(true);
       setSelectedPubId(pubInMonth.id);
     }
   };
 
   const handlePeriodChange = (pubId: string) => {
+    setHasManualSelection(true);
     setSelectedPubId(pubId);
   };
 
@@ -511,7 +519,10 @@ export const DemocraticCompetitivenessMapNative: React.FC = () => {
                   stateName={selectedStateMeta.name}
                   activePublication={activePublication}
                   allPublications={publications}
-                  onSelectPublication={(pub) => setSelectedPubId(pub.id)}
+                  onSelectPublication={(pub) => {
+                    setHasManualSelection(true);
+                    setSelectedPubId(pub.id);
+                  }}
                 />
               </div>
             </div>

@@ -165,7 +165,8 @@ export function getStateDetails(
     'deteriorating': 'Deteriorating',
     'insufficient-basis': 'Insufficient basis',
     'improving': 'Improving',
-    'stable': 'Stable'
+    'stable': 'Stable',
+    'unchanged': 'Unchanged'
   };
   const directionLabel = directionLabels[direction.toLowerCase()] || direction;
 
@@ -297,6 +298,8 @@ export const SECTORS = [
 ];
 
 import { useCMS } from '../context/CMSContext';
+import { getPublishedDcmSorted } from '../utils/dcmComparison';
+import { NIGERIA_37_JURISDICTIONS } from '../types/dcm';
 
 const CLASS_TO_CODE: Record<string, string> = {
   'Open': 'G',
@@ -314,28 +317,32 @@ export interface DcmPreviewProps {
 export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hideAside = false }) => {
   const { dcmPublications } = useCMS();
 
-  // Combine dynamic CMS publications (if available) with fallback prototype publications
+  // Combine dynamic published CMS publications (if available) sorted chronologically ascending
   const allPubs: DcmPubItem[] = useMemo(() => {
-    if (dcmPublications && dcmPublications.length > 0) {
-      // Sort chronologically ascending for timeline
-      const sorted = [...dcmPublications].sort((a, b) => new Date(a.periodStart).getTime() - new Date(b.periodStart).getTime());
-      return sorted.map((pub) => {
+    const published = getPublishedDcmSorted(dcmPublications);
+    if (published.length > 0) {
+      return published.map((pub) => {
         const clsMap: Record<string, string> = {};
         const detailsMap: Record<string, DcmStateDetail> = {};
         if (pub.classifications) {
           for (const [code, rec] of Object.entries(pub.classifications)) {
-            const stateName = rec.stateName === 'Federal Capital Territory' || code === 'FC' ? 'FCT' : rec.stateName;
+            const canonicalFromCode = NIGERIA_37_JURISDICTIONS.find((j) => j.code === code)?.name;
+            const rawName = rec.stateName || canonicalFromCode || code;
+            const stateName = rawName === 'Federal Capital Territory' || code === 'FC' ? 'FCT' : rawName;
             clsMap[stateName] = CLASS_TO_CODE[rec.classification] || 'X';
             detailsMap[stateName] = {
               keyFinding: rec.keyFinding || rec.classificationRationale || rec.evidenceSummary || '',
               confidence: rec.confidence || (rec.classification === 'Insufficient evidence' ? 'Low' : 'Medium'),
-              direction: rec.direction || (rec.classification === 'Insufficient evidence' ? 'insufficient-basis' : 'newly-classified')
+              direction: rec.direction || (rec.classification === 'Insufficient evidence' ? 'insufficient-basis' : 'newly-classified'),
+              rightOfResponse: rec.rightOfResponseStatus || 'Requested'
             };
           }
         }
+        const parsedMonth = Number(pub.month);
+        const monthIdx = parsedMonth >= 1 && parsedMonth <= 12 ? parsedMonth - 1 : 9;
         return {
           year: Number(pub.year) || 2026,
-          month: (Number(pub.month) || 10) - 1,
+          month: monthIdx,
           half: Number(pub.periodIndex) === 1 ? 0 : 1,
           pubTitle: pub.title || 'Democratic Competitiveness Map',
           label: pub.reportingPeriodLabel || pub.title,
@@ -351,15 +358,18 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
     return DCM_PUBS;
   }, [dcmPublications]);
 
-  // Publication index state (defaults to latest)
-  const [pi, setPi] = useState<number>(() => allPubs.length - 1);
+  const latestPubIndex = Math.max(0, allPubs.length - 1);
 
-  // Sync index if publications count changes
+  // Publication index state (defaults to latest) and tracks whether user manually picked an archive period
+  const [pi, setPi] = useState<number>(() => latestPubIndex);
+  const [hasManualSelection, setHasManualSelection] = useState<boolean>(false);
+
+  // Always update to the newest DCM map on homepage (hideAside) or before manual archive selection
   React.useEffect(() => {
-    if (pi >= allPubs.length) {
-      setPi(Math.max(0, allPubs.length - 1));
+    if (hideAside || !hasManualSelection || pi >= allPubs.length) {
+      setPi(latestPubIndex);
     }
-  }, [allPubs.length, pi]);
+  }, [hideAside, hasManualSelection, latestPubIndex, allPubs.length, pi]);
 
   // Selected state on map/dropdown (defaults to null so no state is clicked by default unless specified in URL)
   const [sel, setSel] = useState<string | null>(() => {
@@ -647,7 +657,8 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
   const [fConsent, setFConsent] = useState<boolean>(false);
   const [fWebsite, setFWebsite] = useState<string>('');
 
-  const safePi = Math.min(Math.max(0, pi), allPubs.length - 1);
+  const effectivePi = hideAside ? latestPubIndex : pi;
+  const safePi = Math.min(Math.max(0, effectivePi), allPubs.length - 1);
   const activePub = allPubs[safePi] || allPubs[allPubs.length - 1];
   const curCls = activePub.cls;
   const prevPub = safePi > 0 ? allPubs[safePi - 1] : null;
@@ -892,6 +903,7 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
     const y = Number(e.target.value);
     for (let i = allPubs.length - 1; i >= 0; i--) {
       if (allPubs[i].year === y) {
+        setHasManualSelection(true);
         setPi(i);
         return;
       }
@@ -902,6 +914,7 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
     const m = Number(e.target.value);
     for (let i = allPubs.length - 1; i >= 0; i--) {
       if (allPubs[i].year === activePub.year && allPubs[i].month === m) {
+        setHasManualSelection(true);
         setPi(i);
         return;
       }
@@ -909,6 +922,7 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
   };
 
   const handlePeriodChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    setHasManualSelection(true);
     setPi(Number(e.target.value));
   };
 
@@ -2115,6 +2129,7 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
                               disabled={h.disabled}
                               onClick={() => {
                                 if (!h.disabled && h.pubIdx >= 0) {
+                                  setHasManualSelection(true);
                                   setPi(h.pubIdx);
                                 }
                               }}
