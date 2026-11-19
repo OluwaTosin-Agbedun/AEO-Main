@@ -117,6 +117,8 @@ export interface DcmPubItem {
   cutoff: string;
   method: string;
   revisions: string;
+  summary?: string;
+  changesSummary?: string;
   cls: Record<string, string>;
   details?: Record<string, DcmStateDetail>;
 }
@@ -219,6 +221,7 @@ export const DCM_PUBS: DcmPubItem[] = [
     cutoff: '30 June 2026',
     method: 'v1.0 (pilot)',
     revisions: 'none',
+    summary: 'Initial pilot map establishing baseline classifications across Nigeria’s 36 states and the FCT.',
     cls: DCM_BASE,
     details: BASELINE_DETAILS
   },
@@ -232,6 +235,7 @@ export const DCM_PUBS: DcmPubItem[] = [
     cutoff: '30 September 2026',
     method: 'v1.0 (pilot)',
     revisions: 'none',
+    summary: 'Initial national assessment evaluating political competition space across Nigeria ahead of the 2027 general elections. Concerns around political mobilisation are evident in Benue, Delta and Enugu, while campaign-access issues have emerged in Anambra, Abia, Imo, Kaduna, Kogi, Osun and Rivers.',
     cls: DCM_P1,
     details: BASELINE_DETAILS
   },
@@ -245,6 +249,7 @@ export const DCM_PUBS: DcmPubItem[] = [
     cutoff: '15 October 2026',
     method: 'v1.1',
     revisions: 'none',
+    summary: 'Three months before the 2027 general elections, the space for opposition campaigning is narrowing in a growing number of states. In the first half of October, five more states showed material concerns, and violence against opposition events and party offices spread beyond the South-East. This brief sets out where conditions are deteriorating, why it matters, and what each institution can do before campaigns intensify.',
     cls: DCM_P2,
     details: {
       ...BASELINE_DETAILS,
@@ -350,6 +355,8 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
           cutoff: pub.evidenceCutoffDate || '',
           method: pub.methodologyVersion || 'v1.1',
           revisions: pub.revisionNote || 'none',
+          summary: pub.summary || '',
+          changesSummary: pub.changesSummary || '',
           cls: clsMap,
           details: detailsMap
         };
@@ -668,81 +675,18 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
     return (map && map[name]) || 'X';
   };
 
-  const kindOf = (a: string, b: string): string => {
-    if (a === 'X') return 'First classification';
-    if (b === 'X') return 'Returned to insufficient evidence';
-    return 'Classification changed';
-  };
-
-  // Comparative changes analysis
-  // Comparative changes analysis
-  const changes = useMemo(() => {
-    if (!prevCls) return [];
-    const list: Array<{
-      name: string;
-      kind: string;
-      fromCat: string;
-      fromHex: string;
-      toCat: string;
-      toHex: string;
-      rationale: string;
-      rightOfResponse: string;
-    }> = [];
-
-    DCM_GEO.states.forEach((s) => {
-      const a = getCatCode(prevCls, s.name);
-      const b = getCatCode(curCls, s.name);
-      if (a !== b) {
-        const details = getStateDetails(activePub, prevPub, s.name);
-        list.push({
-          name: s.name,
-          kind: kindOf(a, b),
-          fromCat: DCM_CAT[a]?.name || 'Insufficient evidence',
-          fromHex: DCM_CAT[a]?.hex || '#c9cdd2',
-          toCat: DCM_CAT[b]?.name || 'Insufficient evidence',
-          toHex: DCM_CAT[b]?.hex || '#c9cdd2',
-          rationale: details.keyFinding,
-          rightOfResponse: details.rightOfResponse || 'Requested'
-        });
-      }
-    });
-
-    return list.sort((x, y) => (x.name < y.name ? -1 : 1));
-  }, [prevCls, curCls, activePub, prevPub]);
-
-  // Formatted summary text
+  // Formatted summary period label and CMS Executive Summary / National Overview paragraphs
   const summaryPeriod = useMemo(() => {
     return activePub.label.replace(/\s*\(.*\)$/, '') === 'Baseline'
       ? 'baseline, 1 July to 13 September 2026'
       : activePub.short;
   }, [activePub]);
 
-  const summaryText = useMemo(() => {
-    if (!prevCls) {
-      return 'This is the first published map. It sets the baseline classification for all 36 states and the FCT.';
-    }
-    if (!changes.length) {
-      return 'No state changed classification in this publication.';
-    }
-    const numberWords = ['Zero', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine', 'Ten'];
-    const n = changes.length;
-    const parts = changes.map((c) => {
-      let reason = (c.rationale || '').trim();
-      if (reason && reason !== 'No additional evidence recorded.') {
-        reason = reason.replace(/^Classification changed following\s+/i, '').replace(/\.+$/, '');
-        if (/^[A-Z][a-z]/.test(reason)) {
-          reason = reason.charAt(0).toLowerCase() + reason.slice(1);
-        }
-      } else {
-        reason = 'verified evidence in the decision record';
-      }
-      return c.kind === 'First classification'
-        ? `${c.name} received its first classification, ${c.toCat}, after ${reason}.`
-        : `${c.name} moved from ${c.fromCat} to ${c.toCat} after ${reason}.`;
-    });
-    const prefix = n === 1 ? 'One state' : n <= 10 ? `${numberWords[n]} states` : `${n} states`;
-    return `${prefix} moved in this publication. ${parts.join(' ')} All other states are unchanged.`;
-  }, [prevCls, changes]);
+  const summaryParagraphs = useMemo(() => {
+    const raw = (activePub.summary || activePub.changesSummary || '').trim();
+    if (!raw) return [];
+    return raw.split(/\n+/).map((p) => p.trim()).filter(Boolean);
+  }, [activePub.summary, activePub.changesSummary]);
 
   // Available dropdown options
   const years = useMemo(() => {
@@ -1007,7 +951,7 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
                 maxWidth: '760px'
               }}
             >
-              Evidence-based classifications of the practical conditions for political competition in the 36 states and the FCT, published twice a month. Use the panel to view any past map or follow one state through the year.
+              Evidence-based classifications of the practical conditions for political competition in the 36 states and the FCT. Use the panel to view any past map or follow one state through the year.
             </p>
           </header>
         ) : (
@@ -1092,8 +1036,8 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
           </div>
         )}
 
-        {/* What changed in this publication summary card */}
-        {!isEmbedded && (
+        {/* Publication Summary / What Changed Card (from CMS Executive Summary / National Overview) */}
+        {!isEmbedded && summaryParagraphs.length > 0 && (
           <section
             aria-label="What changed in this publication"
             style={{
@@ -1103,7 +1047,7 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
               padding: '20px 24px',
               display: 'flex',
               flexDirection: 'column',
-              gap: '8px'
+              gap: '10px'
             }}
           >
             <h2
@@ -1117,16 +1061,19 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
             >
               What changed in this publication ({summaryPeriod})
             </h2>
-            <p
-              style={{
-                margin: 0,
-                fontSize: '15px',
-                lineHeight: 1.55,
-                color: '#3d4752'
-              }}
-            >
-              {summaryText}
-            </p>
+            {summaryParagraphs.map((paragraph, idx) => (
+              <p
+                key={idx}
+                style={{
+                  margin: 0,
+                  fontSize: '15px',
+                  lineHeight: 1.55,
+                  color: '#3d4752'
+                }}
+              >
+                {paragraph}
+              </p>
+            ))}
           </section>
         )}
 
