@@ -5,6 +5,8 @@ import {
   NIGERIA_MAP_VIEWBOX, 
   NigeriaStatePathData 
 } from '../data/nigeriaSvgPaths';
+import { resolveCanonicalStateView, resolvePublicationMetadata } from '../utils/dcmConsistency';
+import { formatDailyDateLabel } from '../utils/dcmDaily';
 
 interface DcmMapProps {
   publication: DcmPublication;
@@ -502,26 +504,10 @@ export const DcmMap: React.FC<DcmMapProps> = ({
           </svg>
         </div>
 
-        {/* Flourish-style Floating Hover Card (positioned relative to zoomed state coordinates, paused when clicked) */}
+        {/* Flourish-style Floating Hover Card (sourced from canonical zero-fabrication state view) */}
         {isAllStatesActive && hoveredState && (() => {
-          const stateRec = publication.classifications[hoveredState.code];
-          const classification = stateRec?.classification || 'Insufficient evidence';
-          const direction = stateRec?.direction || (classification === 'Insufficient evidence' ? 'insufficient-basis' : 'newly-classified');
-          const directionLabel = direction === 'newly-classified' ? 'Newly classified'
-            : direction === 'deteriorating' ? 'Deteriorating'
-            : direction === 'insufficient-basis' ? 'Insufficient basis'
-            : direction === 'improving' ? 'Improving'
-            : direction === 'stable' ? 'Stable'
-            : direction;
-          const confidence = stateRec?.confidence || (classification === 'Insufficient evidence' ? 'Low' : 'Medium');
-          const keyFinding = stateRec?.keyFinding || stateRec?.classificationRationale || stateRec?.evidenceSummary || (
-            hoveredState.name === 'Kaduna' 
-              ? 'Police confirm using tear gas at the ADC governorship launch; supporters of both main parties allege attacks.'
-              : classification === 'Insufficient evidence'
-                ? 'Insufficient verified evidence held by AEO for classification.'
-                : 'Material political competition dynamics documented for reporting period.'
-          );
-          const updatedDate = publication.evidenceCutoffDate || publication.publicationDate || '28 September 2026';
+          const stateView = resolveCanonicalStateView(publication, hoveredState.code);
+          const pubMeta = resolvePublicationMetadata(publication);
 
           const containerW = mapContainerRef.current?.clientWidth || 800;
           const containerH = mapContainerRef.current?.clientHeight || 660;
@@ -545,34 +531,55 @@ export const DcmMap: React.FC<DcmMapProps> = ({
               }}
             >
               <h4 className="font-bold text-lg text-slate-900 mb-2 leading-tight">
-                {hoveredState.name}
+                {stateView.stateName}
               </h4>
 
               <div className="flex flex-col gap-1.5 text-xs leading-snug">
-                <div>
+                <div className="flex items-center gap-1.5 flex-wrap">
                   <strong className="text-slate-900">DCM Classification: </strong>
-                  <span className="text-slate-700">{classification}</span>
+                  <span
+                    aria-hidden="true"
+                    className="inline-block w-2.5 h-2.5 rounded-xs border border-slate-400"
+                    style={{ backgroundColor: stateView.hex }}
+                  />
+                  <span className="text-slate-700">{stateView.classification}</span>
                 </div>
 
                 <div>
                   <strong className="text-slate-900">Direction: </strong>
-                  <span className="text-slate-700">{directionLabel}</span>
+                  <span className="text-slate-700">{stateView.directionLabel}</span>
                 </div>
 
                 <div>
                   <strong className="text-slate-900">Confidence: </strong>
-                  <span className="text-slate-700">{confidence}</span>
+                  <span className="text-slate-700">{stateView.confidenceLabel}</span>
                 </div>
 
                 <div>
                   <strong className="text-slate-900">Key Finding: </strong>
-                  <span className="text-slate-700">{keyFinding}</span>
+                  <span className={stateView.hasApprovedFinding ? 'text-slate-700' : 'text-slate-500 italic'}>
+                    {stateView.keyFinding}
+                  </span>
                 </div>
+
+                {stateView.carriedForward && (
+                  <div className="text-[11px] text-slate-600">
+                    <strong className="text-slate-900">Assessment Status: </strong>
+                    <span>Carried forward from prior approved assessment</span>
+                  </div>
+                )}
+
+                {stateView.lastSubstantiveReviewDate && (
+                  <div className="text-[11px] text-slate-600">
+                    <strong className="text-slate-900">Last Substantive Review: </strong>
+                    <span>{formatDailyDateLabel(stateView.lastSubstantiveReviewDate)}</span>
+                  </div>
+                )}
               </div>
 
               <div className="mt-3 pt-2.5 border-t border-slate-100 text-[11px] text-slate-500 leading-normal">
                 <div>AEO Democratic Competitiveness Map (DCM)</div>
-                <div>Updated: {updatedDate}</div>
+                <div>{pubMeta.isDaily ? `Evidence cut-off: ${pubMeta.evidenceCutoffLabel}` : `Updated: ${pubMeta.evidenceCutoffLabel}`}</div>
               </div>
             </div>
           );

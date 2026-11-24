@@ -1,9 +1,27 @@
 import { DcmPublication, DcmComparisonResult, DcmStateChange, NIGERIA_37_JURISDICTIONS } from '../types/dcm';
 
 /**
- * Extracts a numeric chronological timestamp for a DCM publication
+ * Extracts a numeric chronological timestamp for a DCM publication.
+ * Daily publications use their WAT evidence cut-off ISO timestamp (or assessmentDate)
+ * so daily updates and legacy period editions sort accurately on a single timeline.
  */
-export function getDcmChronoTimestamp(pub: Pick<DcmPublication, 'periodEnd' | 'periodStart' | 'year' | 'month' | 'periodIndex'>): number {
+export function getDcmChronoTimestamp(
+  pub: Pick<
+    DcmPublication,
+    'publicationFormat' | 'evidenceCutoffDateTimeWat' | 'assessmentDate' | 'periodEnd' | 'periodStart' | 'year' | 'month' | 'periodIndex'
+  >
+): number {
+  if (pub.publicationFormat === 'daily') {
+    if (pub.evidenceCutoffDateTimeWat) {
+      const cutoffTs = new Date(pub.evidenceCutoffDateTimeWat).getTime();
+      if (!Number.isNaN(cutoffTs)) return cutoffTs;
+    }
+    if (pub.assessmentDate) {
+      const assessTs = new Date(`${pub.assessmentDate}T23:59:59+01:00`).getTime();
+      if (!Number.isNaN(assessTs)) return assessTs;
+    }
+  }
+
   const endTs = pub.periodEnd ? new Date(pub.periodEnd).getTime() : NaN;
   if (!Number.isNaN(endTs)) return endTs;
 
@@ -17,7 +35,7 @@ export function getDcmChronoTimestamp(pub: Pick<DcmPublication, 'periodEnd' | 'p
 }
 
 /**
- * Sorts DCM publications chronologically ascending by reporting period end date,
+ * Sorts DCM publications chronologically ascending by reporting period end / daily cut-off timestamp,
  * with deterministic tiebreakers on periodIndex, isLatest, and updatedAt.
  */
 export function sortDcmChronologically(publications: DcmPublication[]): DcmPublication[] {
@@ -34,6 +52,13 @@ export function sortDcmChronologically(publications: DcmPublication[]): DcmPubli
     const periodDiff = (Number(a.periodIndex) || 0) - (Number(b.periodIndex) || 0);
     if (periodDiff !== 0) return periodDiff;
 
+    const revDiff = (Number(a.revisionNumber) || 1) - (Number(b.revisionNumber) || 1);
+    if (revDiff !== 0) return revDiff;
+
+    const pubTsA = a.publishedAt ? new Date(a.publishedAt).getTime() || 0 : 0;
+    const pubTsB = b.publishedAt ? new Date(b.publishedAt).getTime() || 0 : 0;
+    if (pubTsA !== pubTsB) return pubTsA - pubTsB;
+
     const latestDiff = Number(Boolean(a.isLatest)) - Number(Boolean(b.isLatest));
     if (latestDiff !== 0) return latestDiff;
 
@@ -42,19 +67,25 @@ export function sortDcmChronologically(publications: DcmPublication[]): DcmPubli
 }
 
 /**
- * Filters to active public DCM publications (published, legacy status-less, or explicitly marked isLatest and not archived)
- * and sorts chronologically ascending.
+ * Filters to strictly released public DCM publications and sorts chronologically ascending.
+ * - Daily publications: STRICTLY requires status === 'published' (drafts and approved-but-unpublished remain private).
+ * - Legacy reporting-period publications: requires status === 'published' (or legacy status-less historical records).
+ *   Draft, approved-but-unpublished, scheduled, and archived records are NEVER exposed publicly, even if isLatest is set.
  */
 export function getPublishedDcmSorted(publications: DcmPublication[]): DcmPublication[] {
   if (!Array.isArray(publications)) return [];
-  const active = publications.filter(
-    (p) => p && p.status !== 'archived' && (p.status === 'published' || !p.status || Boolean(p.isLatest))
-  );
+  const active = publications.filter((p) => {
+    if (!p) return false;
+    if (p.publicationFormat === 'daily') {
+      return p.status === 'published';
+    }
+    return p.status === 'published' || !p.status;
+  });
   return sortDcmChronologically(active);
 }
 
 /**
- * Returns the newest active DCM publication (chronologically latest period).
+ * Returns the newest released public DCM publication (chronologically latest edition).
  */
 export function getLatestDcmPublication(publications: DcmPublication[]): DcmPublication | null {
   const sorted = getPublishedDcmSorted(publications);
@@ -62,7 +93,8 @@ export function getLatestDcmPublication(publications: DcmPublication[]): DcmPubl
 }
 
 /**
- * Automatically compares a DCM publication against its immediately preceding published counterpart
+ * Automatically compares a DCM publication against its immediately preceding published counterpart.
+ * Reports only factual classification differences (never fabricates direction/improvement/deterioration).
  */
 export function compareDcmPublications(
   currentPublication: DcmPublication,
@@ -108,7 +140,7 @@ export function compareDcmPublications(
         stateName: jurisdiction.name,
         previousClassification: prevRecord.classification,
         newClassification: currRecord.classification,
-        rationale: currRecord.classificationRationale || '',
+        rationale: (currRecord.keyFinding || currRecord.classificationRationale || '').trim(),
         rightOfResponseStatus: currRecord.rightOfResponseStatus,
         changeType
       });

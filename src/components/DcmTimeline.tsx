@@ -1,5 +1,7 @@
 import React from 'react';
-import { DcmPublication, DCM_COLORS, MONTH_NAMES, DcmClassification } from '../types/dcm';
+import { DcmPublication, MONTH_NAMES } from '../types/dcm';
+import { getPublishedDcmSorted } from '../utils/dcmComparison';
+import { resolveCanonicalStateView } from '../utils/dcmConsistency';
 
 interface DcmTimelineProps {
   stateCode: string;
@@ -34,7 +36,7 @@ export const DcmTimeline: React.FC<DcmTimelineProps> = ({
   allPublications,
   onSelectPublication
 }) => {
-  const publishedOnly = allPublications.filter(p => p.status === 'published');
+  const publishedOnly = getPublishedDcmSorted(allPublications);
   const targetYear = activePublication.year || 2026;
 
   // Publications for target year
@@ -56,10 +58,8 @@ export const DcmTimeline: React.FC<DcmTimelineProps> = ({
 
       {/* Baseline Publication Banner (displayed separately from fortnightly timeline cells) */}
       {baselinePub && (() => {
-        const baseRec = baselinePub.classifications[stateCode];
-        const baseClass = baseRec?.classification;
+        const baseView = resolveCanonicalStateView(baselinePub, stateCode);
         const isSelectedBase = baselinePub.id === activePublication.id;
-        const colorMeta = baseClass ? DCM_COLORS[baseClass] : null;
 
         return (
           <div className="p-3 bg-white rounded-xl border border-slate-300 shadow-xs flex items-center justify-between gap-3">
@@ -79,13 +79,13 @@ export const DcmTimeline: React.FC<DcmTimelineProps> = ({
                 isSelectedBase ? 'ring-2 ring-slate-900 ring-offset-2' : 'hover:opacity-90'
               }`}
               style={{
-                backgroundColor: colorMeta ? colorMeta.fill : '#E2E8F0',
-                color: colorMeta ? '#FFFFFF' : '#1E293B'
+                backgroundColor: baseView.hex,
+                color: baseView.code === 'R' ? '#FFFFFF' : '#1E293B'
               }}
-              title={`${baselinePub.reportingPeriodLabel}: ${stateName} was ${baseClass || 'Data unavailable'}`}
+              title={`${baselinePub.reportingPeriodLabel}: ${stateName} was ${baseView.classification}`}
             >
               <span className="w-2 h-2 rounded-full bg-white/90" />
-              <span>{baseClass || 'Data unavailable'}</span>
+              <span>{baseView.classification}</span>
               {isSelectedBase && <span className="text-[11px]">●</span>}
             </button>
           </div>
@@ -98,9 +98,15 @@ export const DcmTimeline: React.FC<DcmTimelineProps> = ({
           const monthNum = mIdx + 1; // 1-12
           const shortMonth = monthName.substring(0, 3);
 
-          // Find standard fortnightly recurring publications ONLY (never baseline)
-          const p1Pub = yearPubs.find(p => !isBaselinePub(p) && p.month === monthNum && p.periodIndex === 1);
-          const p2Pub = yearPubs.find(p => !isBaselinePub(p) && p.month === monthNum && p.periodIndex === 2);
+          // Find matching edition for each half-month (preferring activePublication if multiple daily editions exist)
+          const findHalfPub = (pIdx: number): DcmPublication | undefined => {
+            const matches = yearPubs.filter(p => !isBaselinePub(p) && p.month === monthNum && p.periodIndex === pIdx);
+            if (matches.length === 0) return undefined;
+            const activeMatch = matches.find(p => p.id === activePublication.id);
+            return activeMatch || matches[matches.length - 1];
+          };
+          const p1Pub = findHalfPub(1);
+          const p2Pub = findHalfPub(2);
 
           const renderPeriodBlock = (pub: DcmPublication | undefined, pIdx: number) => {
             const periodLabel = pIdx === 1 ? '1–15' : '16–End';
@@ -118,22 +124,19 @@ export const DcmTimeline: React.FC<DcmTimelineProps> = ({
               );
             }
 
-            const stateRec = pub.classifications[stateCode];
-            const hasClassification = Boolean(stateRec && stateRec.classification);
-            const classification = hasClassification ? stateRec.classification : null;
-            const colorMeta = classification ? DCM_COLORS[classification] : null;
+            const stateView = resolveCanonicalStateView(pub, stateCode);
             const isSelectedPub = pub.id === activePublication.id;
 
             return (
               <button
                 type="button"
                 onClick={() => onSelectPublication(pub)}
-                title={`${pub.reportingPeriodLabel}: ${stateName} was ${classification || 'Data unavailable'}. Click to view this map.`}
+                title={`${pub.reportingPeriodLabel}: ${stateName} was ${stateView.classification}. Click to view this map.`}
                 className={`h-8 w-full rounded transition-all flex flex-col items-center justify-center cursor-pointer relative group ${
                   isSelectedPub ? 'ring-2 ring-slate-900 ring-offset-2 scale-[1.04] shadow-md z-10' : 'hover:scale-105'
                 }`}
-                style={{ backgroundColor: colorMeta ? colorMeta.fill : '#E2E8F0' }}
-                aria-label={`${pub.reportingPeriodLabel}: ${classification || 'Data unavailable'} — click to view map`}
+                style={{ backgroundColor: stateView.hex }}
+                aria-label={`${pub.reportingPeriodLabel}: ${stateView.classification} — click to view map`}
               >
                 <span className="text-[9px] font-mono font-bold text-white drop-shadow-[0_1px_1.5px_rgba(0,0,0,0.7)] leading-tight px-0.5 text-center tracking-tight">
                   {fullPeriodDate}

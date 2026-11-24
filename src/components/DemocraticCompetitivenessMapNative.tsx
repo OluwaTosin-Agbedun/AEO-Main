@@ -13,7 +13,17 @@ import {
   NIGERIA_37_JURISDICTIONS,
   MONTH_NAMES 
 } from '../types/dcm';
-import { compareDcmPublications, getPublishedDcmSorted, sortDcmChronologically } from '../utils/dcmComparison';
+import {
+  compareDcmPublications,
+  getDcmChronoTimestamp,
+  sortDcmChronologically
+} from '../utils/dcmComparison';
+import {
+  buildCanonicalPublicationView,
+  resolvePublicDcmPublications,
+  resolveSelectedPublication
+} from '../utils/dcmConsistency';
+import { formatDailyDateLabel } from '../utils/dcmDaily';
 import { DcmMap } from './DcmMap';
 import { DcmTimeline } from './DcmTimeline';
 import { DcmBriefRequestModal } from './DcmBriefRequestModal';
@@ -22,21 +32,17 @@ import { INITIAL_DCM_PUBLICATIONS } from '../data/dcmInitialData';
 export const DemocraticCompetitivenessMapNative: React.FC = () => {
   const { dcmPublications } = useCMS();
 
-  // Use active CMS publications sorted chronologically, falling back to initial seed
+  // Single canonical source of strictly published CMS publications sorted chronologically ascending
   const publications: DcmPublication[] = useMemo(() => {
-    const cmsActive = getPublishedDcmSorted(dcmPublications);
-    if (cmsActive.length > 0) {
-      return cmsActive;
-    }
-    return getPublishedDcmSorted(INITIAL_DCM_PUBLICATIONS);
+    return resolvePublicDcmPublications(dcmPublications, INITIAL_DCM_PUBLICATIONS);
   }, [dcmPublications]);
 
-  // Chronologically sorted (descending for latest-first selection)
+  // Chronologically sorted descending for latest-first selectors
   const sortedDesc = useMemo(() => {
     return sortDcmChronologically(publications).reverse();
   }, [publications]);
 
-  // Default publication: latest published
+  // Default publication: latest released edition
   const [selectedPubId, setSelectedPubId] = useState<string>(() => {
     const latest = sortedDesc[0];
     return latest?.id || INITIAL_DCM_PUBLICATIONS[0].id;
@@ -52,10 +58,17 @@ export const DemocraticCompetitivenessMapNative: React.FC = () => {
   // Modal for Request DCM Brief
   const [isBriefModalOpen, setIsBriefModalOpen] = useState<boolean>(false);
 
-  // Active publication object
-  const activePublication = useMemo(() => {
-    return publications.find(p => p.id === selectedPubId) || sortedDesc[0] || INITIAL_DCM_PUBLICATIONS[0];
-  }, [publications, selectedPubId, sortedDesc]);
+  // Single canonical publication resolution (never silently jumps a manually chosen historical edition to latest)
+  const selectionResolution = useMemo(() => {
+    return resolveSelectedPublication(publications, selectedPubId, !hasManualSelection);
+  }, [publications, selectedPubId, hasManualSelection]);
+
+  const activePublication = selectionResolution.activePublication || sortedDesc[0] || INITIAL_DCM_PUBLICATIONS[0];
+  const isLatestPublished = selectionResolution.isLatest;
+  const canonicalView = useMemo(
+    () => buildCanonicalPublicationView(activePublication),
+    [activePublication]
+  );
 
   // Automatically sync to the newest published map on live updates unless user manually chose a past period
   useEffect(() => {
@@ -95,16 +108,16 @@ export const DemocraticCompetitivenessMapNative: React.FC = () => {
     return months.sort((a, b) => a - b);
   }, [publications, activePublication.year]);
 
-  // Available Periods for selected Year & Month
+  // Available Periods for selected Year & Month (sorted by actual assessment/cut-off date descending)
   const availablePeriods = useMemo(() => {
     return publications
       .filter(p => p.year === activePublication.year && p.month === activePublication.month)
-      .sort((a, b) => new Date(b.periodEnd).getTime() - new Date(a.periodEnd).getTime());
+      .sort((a, b) => getDcmChronoTimestamp(b) - getDcmChronoTimestamp(a));
   }, [publications, activePublication.year, activePublication.month]);
 
-  // Handlers for selectors
+  // Handlers for selectors (select newest published edition in chosen year/month)
   const handleYearChange = (year: number) => {
-    const pubInYear = publications.find(p => p.year === year);
+    const pubInYear = sortedDesc.find(p => p.year === year);
     if (pubInYear) {
       setHasManualSelection(true);
       setSelectedPubId(pubInYear.id);
@@ -112,7 +125,7 @@ export const DemocraticCompetitivenessMapNative: React.FC = () => {
   };
 
   const handleMonthChange = (month: number) => {
-    const pubInMonth = publications.find(p => p.year === activePublication.year && p.month === month);
+    const pubInMonth = sortedDesc.find(p => p.year === activePublication.year && p.month === month);
     if (pubInMonth) {
       setHasManualSelection(true);
       setSelectedPubId(pubInMonth.id);
@@ -124,38 +137,13 @@ export const DemocraticCompetitivenessMapNative: React.FC = () => {
     setSelectedPubId(pubId);
   };
 
-  // State counts summary for active publication (STRICT DATA INTEGRITY: Never convert missing to Insufficient evidence)
-  const { stateCounts, unavailableCount, totalValidAudited } = useMemo(() => {
-    const counts: Record<DcmClassification, number> = {
-      'Open': 0,
-      'Emerging concern': 0,
-      'Constrained': 0,
-      'Severely constrained': 0,
-      'Insufficient evidence': 0
-    };
-    let unavail = 0;
+  // State counts summary directly from canonicalView (strict data integrity)
+  const stateCounts = canonicalView.counts;
+  const unavailableCount = canonicalView.unavailableCount;
+  const totalValidAudited = canonicalView.totalClassified;
 
-    for (const j of NIGERIA_37_JURISDICTIONS) {
-      const rec = activePublication.classifications[j.code];
-      const cls = rec?.classification;
-      if (cls && DCM_CLASSIFICATIONS.includes(cls)) {
-        counts[cls] = (counts[cls] || 0) + 1;
-      } else {
-        unavail += 1;
-      }
-    }
-
-    const totalValid = Object.values(counts).reduce((acc, c) => acc + c, 0);
-
-    return {
-      stateCounts: counts,
-      unavailableCount: unavail,
-      totalValidAudited: totalValid
-    };
-  }, [activePublication]);
-
-  // Selected state details
-  const selectedStateRecord = selectedStateCode ? activePublication.classifications[selectedStateCode] : null;
+  // Selected state canonical view
+  const selectedStateView = selectedStateCode ? canonicalView.statesByCode[selectedStateCode] || null : null;
   const selectedStateMeta = selectedStateCode ? NIGERIA_37_JURISDICTIONS.find(j => j.code === selectedStateCode) : null;
 
   const scrollToMap = () => {
@@ -333,11 +321,10 @@ export const DemocraticCompetitivenessMapNative: React.FC = () => {
               >
                 <option value="">All States (Full National View)</option>
                 {NIGERIA_37_JURISDICTIONS.map(j => {
-                  const stateRec = activePublication.classifications[j.code];
-                  const stateClass = stateRec?.classification;
+                  const stView = canonicalView.statesByCode[j.code];
                   return (
                     <option key={j.code} value={j.code}>
-                      {j.name} ({stateClass || 'Data unavailable'})
+                      {j.name} ({stView ? stView.classification : 'Data unavailable'})
                     </option>
                   );
                 })}
@@ -435,7 +422,7 @@ export const DemocraticCompetitivenessMapNative: React.FC = () => {
         {/* 4. SELECTED-STATE DETAILS / HISTORY                                 */}
         {/* =================================================================== */}
         <section aria-labelledby="dcm-state-section-title">
-          {selectedStateRecord && selectedStateMeta ? (
+          {selectedStateView && selectedStateMeta ? (
             <div className="bg-white border-2 border-brand-blue/30 rounded-2xl p-6 sm:p-8 shadow-sm space-y-6">
               <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4 border-b border-line pb-4">
                 <div>
@@ -443,7 +430,7 @@ export const DemocraticCompetitivenessMapNative: React.FC = () => {
                     {selectedStateMeta.zone} Region
                   </span>
                   <h3 id="dcm-state-section-title" className="font-display font-bold text-2xl sm:text-3xl text-ink mt-0.5">
-                    {selectedStateMeta.name} State
+                    {selectedStateMeta.name === 'FCT' ? 'Federal Capital Territory (FCT)' : `${selectedStateMeta.name} State`}
                   </h3>
                 </div>
 
@@ -463,49 +450,63 @@ export const DemocraticCompetitivenessMapNative: React.FC = () => {
                 <div className="space-y-4">
                   <div className="space-y-1.5">
                     <span className="text-xs font-mono font-bold text-mut uppercase tracking-wider block">
-                      Classification ({activePublication.reportingPeriodLabel})
+                      Classification ({canonicalView.meta.periodLabel})
                     </span>
                     <div className="flex items-center gap-2.5">
                       <span
                         className="w-4 h-4 rounded-full shrink-0 border border-black/10"
-                        style={{ backgroundColor: DCM_COLORS[selectedStateRecord.classification]?.fill || '#94A3B8' }}
+                        style={{ backgroundColor: selectedStateView.hex }}
                       />
                       <span className="font-display font-bold text-xl text-ink">
-                        {selectedStateRecord.classification || 'Data unavailable'}
+                        {selectedStateView.classification}
                       </span>
+                    </div>
+                    <div className="text-xs text-ink2 flex flex-wrap gap-x-4 gap-y-1 pt-1">
+                      <span><strong>Direction:</strong> {selectedStateView.directionLabel}</span>
+                      <span><strong>Confidence:</strong> {selectedStateView.confidenceLabel}</span>
                     </div>
                   </div>
 
-                  {selectedStateRecord.classificationRationale && (
-                    <div className="space-y-1.5 p-4 bg-paper rounded-xl border border-line">
-                      <span className="text-xs font-mono font-bold text-ink uppercase tracking-wider block">
-                        Classification Rationale
-                      </span>
-                      <p className="text-xs sm:text-sm text-ink2 leading-relaxed">
-                        {selectedStateRecord.classificationRationale}
-                      </p>
+                  <div className="space-y-1.5 p-4 bg-paper rounded-xl border border-line">
+                    <span className="text-xs font-mono font-bold text-ink uppercase tracking-wider block">
+                      Key Finding / Classification Rationale
+                    </span>
+                    <p className={`text-xs sm:text-sm leading-relaxed ${selectedStateView.hasApprovedFinding ? 'text-ink2' : 'text-mut italic'}`}>
+                      {selectedStateView.keyFinding}
+                    </p>
+                  </div>
+
+                  {selectedStateView.carriedForward && (
+                    <div className="text-xs font-mono bg-slate-50 p-3 rounded-xl border border-line text-slate-700">
+                      <strong>Assessment Status:</strong> Carried forward from prior approved assessment
+                      {selectedStateView.lastSubstantiveReviewDate && (
+                        <span> · Last substantive review: {formatDailyDateLabel(selectedStateView.lastSubstantiveReviewDate)}</span>
+                      )}
                     </div>
                   )}
                 </div>
 
                 {/* Right: Evidence Summary & Right of Response */}
                 <div className="space-y-4">
-                  {selectedStateRecord.evidenceSummary && selectedStateRecord.evidenceSummary.trim() ? (
+                  {selectedStateView.evidenceSummary ? (
                     <div className="space-y-1.5 p-4 bg-paper rounded-xl border border-line">
                       <span className="text-xs font-mono font-bold text-ink uppercase tracking-wider block">
                         Evidence Summary
                       </span>
                       <p className="text-xs sm:text-sm text-ink2 leading-relaxed">
-                        {selectedStateRecord.evidenceSummary}
+                        {selectedStateView.evidenceSummary}
                       </p>
                     </div>
                   ) : null}
 
-                  {selectedStateRecord.rightOfResponseStatus && selectedStateRecord.rightOfResponseStatus !== 'Not required' && (
+                  {selectedStateView.rightOfResponseLabel &&
+                    selectedStateView.rightOfResponseLabel !== 'Not required' &&
+                    selectedStateView.rightOfResponseLabel !== 'Not specified' &&
+                    selectedStateView.rightOfResponseLabel !== 'Not recorded' && (
                     <div className="flex items-center justify-between text-xs font-mono bg-blue-50/70 p-3 rounded-xl border border-blue-100">
                       <span className="text-slate-600 font-semibold">Right of Response:</span>
                       <span className="font-bold text-brand-blue">
-                        {selectedStateRecord.rightOfResponseStatus}
+                        {selectedStateView.rightOfResponseLabel}
                       </span>
                     </div>
                   )}
@@ -708,7 +709,7 @@ export const DemocraticCompetitivenessMapNative: React.FC = () => {
               </h3>
             </div>
 
-            {activePublication.isLatest && (
+            {isLatestPublished && (
               <span className="px-3 py-1 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-full text-xs font-mono font-bold flex items-center gap-1.5 self-start">
                 <Check className="w-3.5 h-3.5" />
                 <span>Current / Latest Published DCM</span>
@@ -719,17 +720,17 @@ export const DemocraticCompetitivenessMapNative: React.FC = () => {
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-xs font-mono">
             <div className="p-3.5 bg-paper rounded-xl border border-line space-y-1">
               <span className="text-mut block">Reporting Period</span>
-              <span className="font-bold text-ink text-sm font-sans block">{activePublication.reportingPeriodLabel}</span>
+              <span className="font-bold text-ink text-sm font-sans block">{canonicalView.meta.periodLabel}</span>
             </div>
 
             <div className="p-3.5 bg-paper rounded-xl border border-line space-y-1">
               <span className="text-mut block">Publication Date</span>
-              <span className="font-bold text-ink text-sm font-sans block">{activePublication.publicationDate}</span>
+              <span className="font-bold text-ink text-sm font-sans block">{canonicalView.meta.publicationDateLabel}</span>
             </div>
 
             <div className="p-3.5 bg-paper rounded-xl border border-line space-y-1">
-              <span className="text-mut block">Evidence Cut-off Date</span>
-              <span className="font-bold text-ink text-sm font-sans block">{activePublication.evidenceCutoffDate}</span>
+              <span className="text-mut block">Evidence Cut-off</span>
+              <span className="font-bold text-ink text-sm font-sans block">{canonicalView.meta.evidenceCutoffLabel}</span>
             </div>
 
             <div className="p-3.5 bg-paper rounded-xl border border-line space-y-1">

@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, useEffect, ReactNode, Dispatch, SetStateAction, useCallback } from 'react';
+import { createContext, useContext, useState, useEffect, useMemo, useRef, ReactNode, Dispatch, SetStateAction, useCallback } from 'react';
 import { Report, DiaryItem, EventItem, TeamMember, WeeklyIssue, HeroConfig, StatItemConfig, AnnouncementItem } from '../types';
 import { 
   REPORTS as initialReports, 
@@ -12,13 +12,42 @@ import {
   ANNOUNCEMENTS as initialAnnouncements
 } from '../data';
 import { auth, db } from '../lib/firebase';
-import { doc, onSnapshot, setDoc, getDoc, runTransaction } from 'firebase/firestore';
+import { onAuthStateChanged } from 'firebase/auth';
+import { collection, deleteDoc, doc, DocumentData, getDocs, limit, onSnapshot, orderBy, query, QueryDocumentSnapshot, setDoc, getDoc, runTransaction, startAfter, where } from 'firebase/firestore';
+import { checkIsAdminUser } from '../lib/adminSession';
 import { saveAssetToFirestore, loadAssetFromFirestore, removeUndefined } from '../lib/firebaseAssets';
 import { handleFirestoreError, OperationType } from '../lib/firebaseError';
 import { sortItemsByDate } from '../utils/date';
 import { generateSlug } from '../utils/url';
-import { DcmPublication } from '../types/dcm';
+import {
+  DcmEditorialHandoverRecord,
+  DcmEditorialHandoverStatus,
+  DcmEvidenceRecord,
+  DcmIncidentDevelopment,
+  DcmIncidentRecord,
+  DcmPrivateNoteRecord,
+  DcmPublication
+} from '../types/dcm';
 import { INITIAL_DCM_PUBLICATIONS } from '../data/dcmInitialData';
+import {
+  formatDailyDateLabel,
+  formatWatCutoff,
+  validateDailyPublication,
+  validateLegacyPublication
+} from '../utils/dcmDaily';
+import { auditPublicationConsistency } from '../utils/dcmConsistency';
+import { getDcmChronoTimestamp } from '../utils/dcmComparison';
+import {
+  sanitizeExternalUrl,
+  validateEvidenceRecord,
+  validateIncidentDevelopment,
+  validateIncidentRecord,
+  validatePrivateNoteRecord
+} from '../utils/dcmEvidence';
+import {
+  DAILY_ARCHIVE_INITIAL_WINDOW,
+  validateEditorialHandoverRecord
+} from '../utils/dcmEditorial';
 import { ApeaAudit, ApeaPublicReportFile, ApeaReportDetail, APEA_DATA, PUBLIC_REPORTS, REPORT_INFO } from '../data/apeaData';
 
 const SUPER_ADMIN_UID = 's39PbuZxqdW1x63i0SsEVE7HqGQ2';
@@ -167,8 +196,52 @@ interface CMSContextType {
   saveStatsConfig: (config: StatItemConfig[]) => Promise<void>;
 
   dcmPublications: DcmPublication[];
+  dcmLegacyPublications: DcmPublication[];
+  dcmDailyPublications: DcmPublication[];
   saveDcmPublication: (pub: DcmPublication) => Promise<void>;
   deleteDcmPublication: (id: string) => Promise<void>;
+  saveDailyDcmPublication: (pub: DcmPublication) => Promise<DcmPublication>;
+  deleteDailyDcmPublication: (id: string) => Promise<void>;
+
+  // Stage 3: Public Evidence, Incident History & Admin-Only Confidential Notes
+  dcmEvidence: DcmEvidenceRecord[];
+  dcmIncidents: DcmIncidentRecord[];
+  dcmIncidentDevelopments: DcmIncidentDevelopment[];
+  dcmPrivateNotes: DcmPrivateNoteRecord[];
+  saveDcmEvidence: (record: DcmEvidenceRecord) => Promise<DcmEvidenceRecord>;
+  deleteDcmEvidence: (id: string) => Promise<void>;
+  saveDcmIncident: (record: DcmIncidentRecord) => Promise<DcmIncidentRecord>;
+  deleteDcmIncident: (id: string) => Promise<void>;
+  saveDcmIncidentDevelopment: (record: DcmIncidentDevelopment) => Promise<DcmIncidentDevelopment>;
+  deleteDcmIncidentDevelopment: (id: string) => Promise<void>;
+  saveDcmPrivateNote: (note: DcmPrivateNoteRecord) => Promise<DcmPrivateNoteRecord>;
+  deleteDcmPrivateNote: (id: string) => Promise<void>;
+
+  // Stage 5, 6 & 7: Strictly bounded chronological archive queries, cursor pagination, accurate error & retry strategy
+  dcmArchiveQueryMode: 'indexed-chronological' | 'index-required-error' | 'admin-full';
+  dcmArchiveError: {
+    code: 'missing-index' | 'query-error';
+    collection: string;
+    message: string;
+    requiredIndex: string;
+    canRetry: boolean;
+    failedAtIso: string;
+  } | null;
+  dcmDailyHasMore: boolean;
+  retryDcmArchiveQueries: () => void;
+  loadDcmPublicationById: (publicationId: string) => Promise<DcmPublication | null>;
+  loadDcmArchiveMonth: (year: number, month: number) => Promise<DcmPublication[]>;
+  loadOlderDailyPublications: (beforeAssessmentDate?: string, pageSize?: number) => Promise<DcmPublication[]>;
+  loadDcmStateEvidence: (stateCode: string) => Promise<void>;
+
+  // Stage 6: Admin-only Editorial Handover Records (Newsletter & ClearPath extracts)
+  dcmEditorialHandovers: DcmEditorialHandoverRecord[];
+  saveDcmEditorialHandover: (record: DcmEditorialHandoverRecord) => Promise<DcmEditorialHandoverRecord>;
+  updateDcmEditorialHandoverStatus: (
+    handoverId: string,
+    handoverStatus: DcmEditorialHandoverStatus,
+    recipientTeam?: string
+  ) => Promise<DcmEditorialHandoverRecord>;
 
   apeaAudits: ApeaAudit[];
   apeaPublicReports: Record<string, ApeaPublicReportFile>;
@@ -300,10 +373,59 @@ export function CMSProvider({ children }: { children: ReactNode }) {
   const [weekly, setWeekly] = useState<WeeklyIssue[]>(initialWeekly);
   const [heroConfig, setHeroConfig] = useState<HeroConfig>(INITIAL_HERO_CONFIG);
   const [statsConfig, setStatsConfig] = useState<StatItemConfig[]>(INITIAL_STATS_CONFIG);
-  const [dcmPublications, setDcmPublications] = useState<DcmPublication[]>(INITIAL_DCM_PUBLICATIONS);
+  const [dcmLegacyPublications, setDcmLegacyPublications] = useState<DcmPublication[]>(INITIAL_DCM_PUBLICATIONS);
+  const [dcmDailyPublications, setDcmDailyPublications] = useState<DcmPublication[]>([]);
+  const [dcmEvidence, setDcmEvidence] = useState<DcmEvidenceRecord[]>([]);
+  const [dcmIncidents, setDcmIncidents] = useState<DcmIncidentRecord[]>([]);
+  const [dcmIncidentDevelopments, setDcmIncidentDevelopments] = useState<DcmIncidentDevelopment[]>([]);
+  const [dcmPrivateNotes, setDcmPrivateNotes] = useState<DcmPrivateNoteRecord[]>([]);
+  const [dcmEditorialHandovers, setDcmEditorialHandovers] = useState<DcmEditorialHandoverRecord[]>([]);
+  const [dcmArchiveQueryMode, setDcmArchiveQueryMode] = useState<'indexed-chronological' | 'index-required-error' | 'admin-full'>('indexed-chronological');
+  const [dcmArchiveError, setDcmArchiveError] = useState<{
+    code: 'missing-index' | 'query-error';
+    collection: string;
+    message: string;
+    requiredIndex: string;
+    canRetry: boolean;
+    failedAtIso: string;
+  } | null>(null);
+  const [dcmDailyHasMore, setDcmDailyHasMore] = useState<boolean>(false);
+  const [dcmQueryRetryToken, setDcmQueryRetryToken] = useState<number>(0);
+  const lastDailyDocSnapRef = useRef<QueryDocumentSnapshot<DocumentData> | null>(null);
+  const [isAdminViewer, setIsAdminViewer] = useState<boolean>(false);
+
+  const retryDcmArchiveQueries = useCallback(() => {
+    setDcmArchiveError(null);
+    lastDailyDocSnapRef.current = null;
+    setDcmQueryRetryToken((n) => n + 1);
+  }, []);
   const [apeaAudits, setApeaAudits] = useState<ApeaAudit[]>(APEA_DATA);
   const [apeaPublicReports, setApeaPublicReports] = useState<Record<string, ApeaPublicReportFile>>(PUBLIC_REPORTS);
   const [apeaReportInfo, setApeaReportInfo] = useState<Record<string, ApeaReportDetail>>(REPORT_INFO);
+
+  // Merge legacy period publications and scalable daily publications (deduplicated by ID, newest first)
+  const dcmPublications = useMemo(() => {
+    const byId = new Map<string, DcmPublication>();
+    for (const legacy of dcmLegacyPublications) {
+      if (legacy && legacy.id) {
+        byId.set(legacy.id, {
+          ...legacy,
+          publicationFormat: legacy.publicationFormat || 'legacy-period'
+        });
+      }
+    }
+    for (const daily of dcmDailyPublications) {
+      if (daily && daily.id) {
+        byId.set(daily.id, {
+          ...daily,
+          publicationFormat: 'daily'
+        });
+      }
+    }
+    return Array.from(byId.values()).sort(
+      (a, b) => getDcmChronoTimestamp(b) - getDcmChronoTimestamp(a)
+    );
+  }, [dcmLegacyPublications, dcmDailyPublications]);
 
   // Subscribe to Firestore in Real-Time for global site sync with STRICT 100% READ-ONLY LISTENERS
   useEffect(() => {
@@ -379,7 +501,9 @@ export function CMSProvider({ children }: { children: ReactNode }) {
       return cfg;
     }));
     unsubscribes.push(subscribeSafe('stats', setStatsConfig, INITIAL_STATS_CONFIG));
-    unsubscribes.push(subscribeSafe('dcm_publications', setDcmPublications, INITIAL_DCM_PUBLICATIONS));
+    // Legacy DCM publications are subscribed conditionally by auth role below:
+    // - Public visitors read strictly published-only projection `/cms/dcm_publications_public`
+    // - Authorised admins read full `/cms/dcm_publications` (preserving unpublished drafts such as dcm-2026-11-end)
 
     // Custom listener for APEA audits document
     const apeaDocRef = doc(db, 'cms', 'apea_audits');
@@ -404,6 +528,383 @@ export function CMSProvider({ children }: { children: ReactNode }) {
       unsubscribes.forEach(unsub => unsub());
     };
   }, []);
+
+  // Track authorised admin authentication state to scope daily DCM collection queries safely
+  useEffect(() => {
+    let active = true;
+    const unsubAuth = onAuthStateChanged(auth, async (user) => {
+      if (!user) {
+        if (active) setIsAdminViewer(false);
+        return;
+      }
+      try {
+        const res = await checkIsAdminUser(user);
+        if (active) setIsAdminViewer(res.isAuthorized);
+      } catch {
+        if (active) setIsAdminViewer(false);
+      }
+    });
+    return () => {
+      active = false;
+      unsubAuth();
+    };
+  }, []);
+
+  // Role-scoped legacy DCM listener (data-access isolation for unpublished drafts in /cms/dcm_publications):
+  // - Unauthenticated / non-admin visitors NEVER read `/cms/dcm_publications` (which holds unpublished drafts such as dcm-2026-11-end).
+  //   They read strictly published-only records from `/cms/dcm_publications_public` (falling back to published INITIAL_DCM_PUBLICATIONS).
+  // - Authorised admins read `/cms/dcm_publications` and non-destructively project ONLY `status === 'published'`
+  //   legacy editions into `/cms/dcm_publications_public` without altering any draft record.
+  useEffect(() => {
+    let cancelled = false;
+    const legacyDocId = isAdminViewer ? 'dcm_publications' : 'dcm_publications_public';
+    const legacyDocRef = doc(db, 'cms', legacyDocId);
+
+    const unsubLegacy = onSnapshot(
+      legacyDocRef,
+      (snapshot) => {
+        if (cancelled) return;
+        if (snapshot.exists() && Array.isArray(snapshot.data()?.items)) {
+          const rawItems = snapshot.data()!.items as DcmPublication[];
+          const scopedItems = isAdminViewer
+            ? rawItems
+            : rawItems.filter((item) => item && item.status === 'published');
+          setDcmLegacyPublications(scopedItems.length > 0 || isAdminViewer ? scopedItems : INITIAL_DCM_PUBLICATIONS);
+
+          if (isAdminViewer && auth.currentUser) {
+            const publishedProjection = rawItems.filter((item) => item && item.status === 'published');
+            const publicRef = doc(db, 'cms', 'dcm_publications_public');
+            getDoc(publicRef)
+              .then((pubSnap) => {
+                if (cancelled) return;
+                const existingPublic: DcmPublication[] =
+                  pubSnap.exists() && Array.isArray(pubSnap.data()?.items) ? pubSnap.data()!.items : [];
+                const existingSig = existingPublic.map((p) => `${p.id}:${p.updatedAt || 0}`).join('|');
+                const nextSig = publishedProjection.map((p) => `${p.id}:${p.updatedAt || 0}`).join('|');
+                if (!pubSnap.exists() || existingSig !== nextSig) {
+                  return setDoc(
+                    publicRef,
+                    removeUndefined({
+                      items: publishedProjection,
+                      updatedAt: Date.now()
+                    })
+                  );
+                }
+              })
+              .catch((syncErr) => {
+                console.warn('Notice syncing published-only legacy DCM projection:', syncErr?.message || syncErr);
+              });
+          }
+        } else if (!isAdminViewer) {
+          setDcmLegacyPublications(INITIAL_DCM_PUBLICATIONS);
+        }
+      },
+      (err) => {
+        console.warn(`Firestore snapshot notice for cms/${legacyDocId}:`, err?.message || err);
+        if (!isAdminViewer) {
+          setDcmLegacyPublications(INITIAL_DCM_PUBLICATIONS);
+        }
+      }
+    );
+
+    return () => {
+      cancelled = true;
+      unsubLegacy();
+    };
+  }, [isAdminViewer]);
+
+  // Scalable read-only real-time listener for individual daily DCM publication documents.
+  // Stage 6 & 7 Hardening:
+  // - Public visitors execute a strictly bounded chronological query:
+  //     where('status', '==', 'published'), orderBy('assessmentDate', 'desc'), limit(60)
+  //   so the newest published daily editions ALWAYS appear first and Firestore reads stay bounded.
+  // - Captures the trailing QueryDocumentSnapshot cursor so cursor-based pagination (loadOlderDailyPublications)
+  //   never skips same-date revisions (e.g. -r1 / -r2) across page boundaries.
+  // - NEVER executes an unbounded full-collection fallback in Production and NEVER silently truncates with an
+  //   unordered limit(). If a required composite index is missing ('failed-precondition'), surfaces an accurate
+  //   error state (dcmArchiveError) with an explicit retry strategy (retryDcmArchiveQueries).
+  useEffect(() => {
+    const dailyCol = collection(db, 'dcm_daily_publications');
+    let activeUnsub: (() => void) | null = null;
+    let cancelled = false;
+
+    const applySnapshot = (snapshot: any, isPublicBounded: boolean) => {
+      const loaded: DcmPublication[] = [];
+      snapshot.forEach((docSnap: any) => {
+        const data = docSnap.data() as DcmPublication;
+        if (data && data.id) {
+          if (!isAdminViewer && data.status !== 'published') return;
+          loaded.push({
+            ...data,
+            publicationFormat: 'daily'
+          });
+        }
+      });
+      if (isPublicBounded) {
+        const docs = snapshot.docs || [];
+        lastDailyDocSnapRef.current = docs.length > 0 ? docs[docs.length - 1] : null;
+        setDcmDailyHasMore(docs.length >= DAILY_ARCHIVE_INITIAL_WINDOW);
+      } else {
+        lastDailyDocSnapRef.current = null;
+        setDcmDailyHasMore(false);
+      }
+      setDcmArchiveError((prev) =>
+        prev?.collection === 'dcm_daily_publications' ? null : prev
+      );
+      setDcmDailyPublications((prev) => {
+        // Merge any previously on-demand fetched published historical editions with the live window
+        const byId = new Map<string, DcmPublication>();
+        for (const existing of prev) {
+          if (!isAdminViewer && existing.status !== 'published') continue;
+          byId.set(existing.id, existing);
+        }
+        for (const item of loaded) {
+          byId.set(item.id, item);
+        }
+        const merged = Array.from(byId.values());
+        merged.sort((a, b) => getDcmChronoTimestamp(b) - getDcmChronoTimestamp(a));
+        return merged;
+      });
+    };
+
+    if (isAdminViewer) {
+      setDcmArchiveQueryMode('admin-full');
+      activeUnsub = onSnapshot(
+        dailyCol,
+        (snap) => applySnapshot(snap, false),
+        (err) => {
+          console.warn('Firestore snapshot notice for dcm_daily_publications (admin):', err?.message || err);
+          setDcmDailyPublications([]);
+        }
+      );
+    } else {
+      setDcmArchiveQueryMode('indexed-chronological');
+      const indexedChronoQuery = query(
+        dailyCol,
+        where('status', '==', 'published'),
+        orderBy('assessmentDate', 'desc'),
+        limit(DAILY_ARCHIVE_INITIAL_WINDOW)
+      );
+
+      activeUnsub = onSnapshot(
+        indexedChronoQuery,
+        (snap) => applySnapshot(snap, true),
+        (err: any) => {
+          if (cancelled) return;
+          const isMissingIndex =
+            err?.code === 'failed-precondition' ||
+            String(err?.message || '').toLowerCase().includes('index');
+          const requiredIndex = 'dcm_daily_publications (status ASC, assessmentDate DESC)';
+          setDcmArchiveQueryMode('index-required-error');
+          setDcmArchiveError({
+            code: isMissingIndex ? 'missing-index' : 'query-error',
+            collection: 'dcm_daily_publications',
+            message: isMissingIndex
+              ? 'The daily DCM archive index is not yet available in this database environment. Latest daily publications cannot be verified until the required Firestore composite index is deployed.'
+              : 'Unable to load the latest daily DCM archive right now. Please retry.',
+            requiredIndex,
+            canRetry: true,
+            failedAtIso: new Date().toISOString()
+          });
+          console.warn(
+            `Bounded chronological query failed for ${requiredIndex}:`,
+            err?.message || err
+          );
+        }
+      );
+    }
+
+    return () => {
+      cancelled = true;
+      if (activeUnsub) activeUnsub();
+    };
+  }, [isAdminViewer, dcmQueryRetryToken]);
+
+  // Stage 3, 5, 6 & 7: Strictly bounded chronologically ordered real-time listeners for Public Evidence,
+  // Incident History, Incident Developments, and Admin-Only Isolated Confidential Notes & Editorial Handovers.
+  // Never performs unbounded public full-collection scans if a composite index is missing; surfaces accurate error + retry.
+  useEffect(() => {
+    const unsubs: (() => void)[] = [];
+    let cancelled = false;
+
+    const subscribeBoundedOrderedPublic = <T extends { id: string; status?: string; visibility?: string }>(
+      colName: string,
+      orderField: string,
+      maxItems: number,
+      onItems: (items: T[]) => void,
+      onFail: () => void
+    ) => {
+      const colRef = collection(db, colName);
+      const parseSnap = (snapshot: any) => {
+        const items: T[] = [];
+        snapshot.forEach((docSnap: any) => {
+          const data = docSnap.data() as T;
+          if (!data || !data.id) return;
+          if (!isAdminViewer && (data.status !== 'published' || data.visibility !== 'public')) return;
+          items.push(data);
+        });
+        setDcmArchiveError((prev) => (prev?.collection === colName ? null : prev));
+        onItems(items);
+      };
+
+      if (isAdminViewer) {
+        unsubs.push(
+          onSnapshot(colRef, parseSnap, (err) => {
+            console.warn(`Firestore snapshot notice for ${colName}:`, err?.message || err);
+            onFail();
+          })
+        );
+        return;
+      }
+
+      const primaryQuery = query(
+        colRef,
+        where('status', '==', 'published'),
+        where('visibility', '==', 'public'),
+        orderBy(orderField, 'desc'),
+        limit(maxItems)
+      );
+
+      const primaryUnsub = onSnapshot(
+        primaryQuery,
+        parseSnap,
+        (err: any) => {
+          if (cancelled) return;
+          const isMissingIndex =
+            err?.code === 'failed-precondition' ||
+            String(err?.message || '').toLowerCase().includes('index');
+          const requiredIndex = `${colName} (status ASC, visibility ASC, ${orderField} DESC)`;
+          if (isMissingIndex) {
+            setDcmArchiveError((prev) =>
+              prev || {
+                code: 'missing-index',
+                collection: colName,
+                message: `Public ${colName.replace(/^dcm_/, '').replace(/_/g, ' ')} records require the composite Firestore index (${requiredIndex}) before loading.`,
+                requiredIndex,
+                canRetry: true,
+                failedAtIso: new Date().toISOString()
+              }
+            );
+          }
+          console.warn(`Bounded chronological query failed for ${requiredIndex}:`, err?.message || err);
+          onFail();
+        }
+      );
+
+      unsubs.push(primaryUnsub);
+    };
+
+    subscribeBoundedOrderedPublic<DcmEvidenceRecord>(
+      'dcm_evidence',
+      'sourcePublicationDate',
+      150,
+      (items) => {
+        setDcmEvidence((prev) => {
+          const byId = new Map<string, DcmEvidenceRecord>();
+          for (const existing of prev) {
+            if (!isAdminViewer && (existing.status !== 'published' || existing.visibility !== 'public')) continue;
+            byId.set(existing.id, existing);
+          }
+          for (const item of items) byId.set(item.id, item);
+          const merged = Array.from(byId.values());
+          merged.sort((a, b) => (b.sourcePublicationDate || '').localeCompare(a.sourcePublicationDate || ''));
+          return merged;
+        });
+      },
+      () => setDcmEvidence([])
+    );
+
+    subscribeBoundedOrderedPublic<DcmIncidentRecord>(
+      'dcm_incidents',
+      'firstReportedDate',
+      150,
+      (items) => {
+        setDcmIncidents((prev) => {
+          const byId = new Map<string, DcmIncidentRecord>();
+          for (const existing of prev) {
+            if (!isAdminViewer && (existing.status !== 'published' || existing.visibility !== 'public')) continue;
+            byId.set(existing.id, existing);
+          }
+          for (const item of items) byId.set(item.id, item);
+          const merged = Array.from(byId.values());
+          merged.sort((a, b) => (b.firstReportedDate || '').localeCompare(a.firstReportedDate || ''));
+          return merged;
+        });
+      },
+      () => setDcmIncidents([])
+    );
+
+    subscribeBoundedOrderedPublic<DcmIncidentDevelopment>(
+      'dcm_incident_developments',
+      'developmentDate',
+      250,
+      (items) => {
+        setDcmIncidentDevelopments((prev) => {
+          const byId = new Map<string, DcmIncidentDevelopment>();
+          for (const existing of prev) {
+            if (!isAdminViewer && (existing.status !== 'published' || existing.visibility !== 'public')) continue;
+            byId.set(existing.id, existing);
+          }
+          for (const item of items) byId.set(item.id, item);
+          const merged = Array.from(byId.values());
+          merged.sort((a, b) => (a.developmentDate || '').localeCompare(b.developmentDate || ''));
+          return merged;
+        });
+      },
+      () => setDcmIncidentDevelopments([])
+    );
+
+    if (isAdminViewer) {
+      const notesCol = collection(db, 'dcm_private_notes');
+      unsubs.push(
+        onSnapshot(
+          notesCol,
+          (snapshot) => {
+            const items: DcmPrivateNoteRecord[] = [];
+            snapshot.forEach((docSnap) => {
+              const data = docSnap.data() as DcmPrivateNoteRecord;
+              if (data && data.id) items.push(data);
+            });
+            items.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+            setDcmPrivateNotes(items);
+          },
+          (err) => {
+            console.warn('Firestore snapshot notice for dcm_private_notes:', err?.message || err);
+            setDcmPrivateNotes([]);
+          }
+        )
+      );
+
+      // Stage 6: Admin-only Editorial Handovers audit collection
+      const handoversCol = collection(db, 'dcm_editorial_handovers');
+      unsubs.push(
+        onSnapshot(
+          handoversCol,
+          (snapshot) => {
+            const items: DcmEditorialHandoverRecord[] = [];
+            snapshot.forEach((docSnap) => {
+              const data = docSnap.data() as DcmEditorialHandoverRecord;
+              if (data && data.id) items.push(data);
+            });
+            items.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+            setDcmEditorialHandovers(items);
+          },
+          (err) => {
+            console.warn('Firestore snapshot notice for dcm_editorial_handovers:', err?.message || err);
+            setDcmEditorialHandovers([]);
+          }
+        )
+      );
+    } else {
+      setDcmPrivateNotes([]);
+      setDcmEditorialHandovers([]);
+    }
+
+    return () => {
+      cancelled = true;
+      unsubs.forEach((u) => u());
+    };
+  }, [isAdminViewer, dcmQueryRetryToken]);
 
   // Sync individual PDF and Image documents from Firestore once live data is connected
   useEffect(() => {
@@ -878,10 +1379,47 @@ export function CMSProvider({ children }: { children: ReactNode }) {
 
   const saveDcmPublication = async (pub: DcmPublication) => {
     const path = 'cms/dcm_publications';
+    const currentUser = auth.currentUser;
+    if (!currentUser) {
+      throw new Error('Unauthorised: You must be signed in as an authorised AEO administrator to save DCM publications.');
+    }
+    const authCheck = await checkIsAdminUser(currentUser);
+    if (!authCheck.isAuthorized) {
+      throw new Error(authCheck.reason || 'Unauthorised: Administrator privileges are required to modify DCM publications.');
+    }
+
+    // Route daily publications automatically to the scalable daily collection
+    if (pub.publicationFormat === 'daily') {
+      await saveDailyDcmPublication(pub);
+      return;
+    }
+
     try {
+      const now = Date.now();
+      const nowIso = new Date(now).toISOString();
+      const stampedApproval =
+        pub.approvalRecord?.approved
+          ? {
+              ...pub.approvalRecord,
+              approved: true,
+              recordedByUid: currentUser.uid,
+              recordedByEmail: currentUser.email || undefined,
+              recordedAt: pub.approvalRecord.recordedAt || nowIso,
+              approvedByUid: currentUser.uid,
+              approvedByEmail: currentUser.email || undefined,
+              verificationMode: 'admin-recorded-reference' as const
+            }
+          : undefined;
+
       const sanitizedPub = await sanitizeItemAssets({
         ...pub,
-        updatedAt: Date.now()
+        publicationFormat: 'legacy-period',
+        approvalRecord: stampedApproval,
+        publishedAt: pub.status === 'published' ? (pub.publishedAt || nowIso) : undefined,
+        isLatest: pub.status === 'published' ? Boolean(pub.isLatest) : false,
+        updatedAt: now,
+        createdByUid: pub.createdByUid || currentUser.uid,
+        updatedByUid: currentUser.uid
       });
 
       let nextDcm: DcmPublication[] = [];
@@ -889,25 +1427,50 @@ export function CMSProvider({ children }: { children: ReactNode }) {
       await runTransaction(db, async (transaction) => {
         const docRef = doc(db, 'cms', 'dcm_publications');
         const sfDoc = await transaction.get(docRef);
-        let current: DcmPublication[] = sfDoc.exists() && Array.isArray(sfDoc.data()?.items)
+        const current: DcmPublication[] = sfDoc.exists() && Array.isArray(sfDoc.data()?.items)
           ? sfDoc.data()!.items
           : INITIAL_DCM_PUBLICATIONS;
 
-        const exists = current.some(p => p.id === pub.id);
-        nextDcm = exists ? current.map(p => p.id === pub.id ? sanitizedPub : p) : [sanitizedPub, ...current];
-        if (pub.isLatest) {
-          nextDcm = nextDcm.map(p => p.id === pub.id ? p : { ...p, isLatest: false });
+        const existingDoc = current.find(p => p.id === sanitizedPub.id) || null;
+        if (existingDoc && existingDoc.status === 'published') {
+          throw new Error(
+            `Historical protection: Published edition "${existingDoc.id}" cannot be overwritten. Issue a corrected revision instead so the previous version is preserved.`
+          );
         }
 
-        nextDcm.sort((a, b) => {
-          const tB = new Date(b.periodEnd || b.periodStart).getTime() || 0;
-          const tA = new Date(a.periodEnd || a.periodStart).getTime() || 0;
-          return tB - tA;
+        const validation = validateLegacyPublication(sanitizedPub, {
+          isAuthorizedAdmin: true,
+          actorUid: currentUser.uid,
+          existingDoc
         });
-        transaction.set(docRef, removeUndefined({ items: nextDcm, updatedAt: Date.now() }));
+        if (!validation.valid) {
+          throw new Error(validation.errors.join(' '));
+        }
+
+        const consistency = auditPublicationConsistency(sanitizedPub);
+        if (!consistency.consistent) {
+          throw new Error(`Consistency check failed: ${consistency.errors.join(' ')}`);
+        }
+
+        const exists = Boolean(existingDoc);
+        nextDcm = exists ? current.map(p => p.id === sanitizedPub.id ? sanitizedPub : p) : [sanitizedPub, ...current];
+        if (sanitizedPub.status === 'published' && sanitizedPub.isLatest) {
+          nextDcm = nextDcm.map(p => p.id === sanitizedPub.id ? p : { ...p, isLatest: false });
+        }
+
+        nextDcm.sort((a, b) => getDcmChronoTimestamp(b) - getDcmChronoTimestamp(a));
+        const tsNow = Date.now();
+        transaction.set(docRef, removeUndefined({ items: nextDcm, updatedAt: tsNow }));
+        transaction.set(
+          doc(db, 'cms', 'dcm_publications_public'),
+          removeUndefined({
+            items: nextDcm.filter((p) => p && p.status === 'published'),
+            updatedAt: tsNow
+          })
+        );
       });
 
-      setDcmPublications(nextDcm);
+      setDcmLegacyPublications(nextDcm);
     } catch (err) {
       console.error('Error saving DCM publication in transaction:', err);
       handleFirestoreError(err, OperationType.WRITE, path);
@@ -917,22 +1480,484 @@ export function CMSProvider({ children }: { children: ReactNode }) {
 
   const deleteDcmPublication = async (id: string) => {
     const path = 'cms/dcm_publications';
+    const currentUser = auth.currentUser;
+    if (!currentUser) {
+      throw new Error('Unauthorised: You must be signed in as an authorised AEO administrator to delete DCM publications.');
+    }
+    const authCheck = await checkIsAdminUser(currentUser);
+    if (!authCheck.isAuthorized) {
+      throw new Error(authCheck.reason || 'Unauthorised: Administrator privileges are required to delete DCM publications.');
+    }
+
     try {
       let nextDcm: DcmPublication[] = [];
 
       await runTransaction(db, async (transaction) => {
         const docRef = doc(db, 'cms', 'dcm_publications');
         const sfDoc = await transaction.get(docRef);
-        let current: DcmPublication[] = sfDoc.exists() && Array.isArray(sfDoc.data()?.items) ? sfDoc.data()!.items : [];
+        const current: DcmPublication[] = sfDoc.exists() && Array.isArray(sfDoc.data()?.items) ? sfDoc.data()!.items : [];
+
+        const target = current.find(p => p.id === id);
+        if (target && target.status === 'published') {
+          throw new Error(
+            `Historical protection: Published DCM edition "${id}" cannot be deleted.`
+          );
+        }
 
         nextDcm = current.filter(p => p.id !== id);
-        transaction.set(docRef, removeUndefined({ items: nextDcm, updatedAt: Date.now() }));
+        const tsNow = Date.now();
+        transaction.set(docRef, removeUndefined({ items: nextDcm, updatedAt: tsNow }));
+        transaction.set(
+          doc(db, 'cms', 'dcm_publications_public'),
+          removeUndefined({
+            items: nextDcm.filter((p) => p && p.status === 'published'),
+            updatedAt: tsNow
+          })
+        );
       });
 
-      setDcmPublications(nextDcm);
+      setDcmLegacyPublications(nextDcm);
     } catch (err) {
       console.error('Error deleting DCM publication in transaction:', err);
       handleFirestoreError(err, OperationType.DELETE, path);
+      throw err;
+    }
+  };
+
+  const saveDailyDcmPublication = async (pub: DcmPublication): Promise<DcmPublication> => {
+    const currentUser = auth.currentUser;
+    if (!currentUser) {
+      throw new Error('Unauthorised: You must be signed in as an authorised AEO administrator to manage daily DCM publications.');
+    }
+    const authCheck = await checkIsAdminUser(currentUser);
+    if (!authCheck.isAuthorized) {
+      throw new Error(authCheck.reason || 'Unauthorised: Administrator privileges are required to publish daily DCM updates.');
+    }
+
+    const docPath = `dcm_daily_publications/${pub.id}`;
+    const docRef = doc(db, 'dcm_daily_publications', pub.id);
+
+    try {
+      const existingSnap = await getDoc(docRef);
+      const existingDoc = existingSnap.exists() ? (existingSnap.data() as DcmPublication) : null;
+
+      if (existingDoc && existingDoc.status === 'published') {
+        throw new Error(
+          `Historical protection: Published daily edition "${existingDoc.id}" cannot be overwritten. Issue a corrected revision or start a new daily edition instead.`
+        );
+      }
+
+      const watCutoff = formatWatCutoff(pub.assessmentDate || '', pub.evidenceCutoffTimeWat || '');
+      const dateLabel = pub.assessmentDate ? formatDailyDateLabel(pub.assessmentDate) : pub.reportingPeriodLabel;
+      const now = Date.now();
+      const nowIso = new Date(now).toISOString();
+
+      const stampedApproval =
+        pub.approvalRecord?.approved
+          ? {
+              ...pub.approvalRecord,
+              approved: true,
+              recordedByUid: currentUser.uid,
+              recordedByEmail: currentUser.email || undefined,
+              recordedAt: pub.approvalRecord.recordedAt || nowIso,
+              approvedByUid: currentUser.uid,
+              approvedByEmail: currentUser.email || undefined,
+              verificationMode: 'admin-recorded-reference' as const
+            }
+          : undefined;
+
+      const candidate: DcmPublication = {
+        ...pub,
+        publicationFormat: 'daily',
+        periodStart: pub.assessmentDate || pub.periodStart,
+        periodEnd: pub.assessmentDate || pub.periodEnd,
+        reportingPeriodLabel: pub.reportingPeriodLabel?.trim() || dateLabel,
+        publicationDate: pub.publicationDate?.trim() || dateLabel,
+        evidenceCutoffDate: watCutoff.valid ? watCutoff.displayLabel : (pub.evidenceCutoffDate || ''),
+        evidenceCutoffDateTimeWat: watCutoff.valid ? watCutoff.isoWat : (pub.evidenceCutoffDateTimeWat || ''),
+        approvalRecord: stampedApproval,
+        publishedAt: pub.status === 'published' ? (pub.publishedAt || nowIso) : undefined,
+        isLatest: pub.status === 'published' ? Boolean(pub.isLatest) : false,
+        createdAt: existingDoc?.createdAt || pub.createdAt || now,
+        updatedAt: now,
+        createdByUid: existingDoc?.createdByUid || pub.createdByUid || currentUser.uid,
+        updatedByUid: currentUser.uid
+      };
+
+      const sourcePub = candidate.carriedForwardFromPublicationId
+        ? dcmPublications.find((p) => p.id === candidate.carriedForwardFromPublicationId) || null
+        : null;
+
+      const validation = validateDailyPublication(candidate, {
+        isAuthorizedAdmin: true,
+        actorUid: currentUser.uid,
+        existingDoc,
+        sourcePub
+      });
+
+      if (!validation.valid) {
+        throw new Error(validation.errors.join(' '));
+      }
+
+      const consistency = auditPublicationConsistency(candidate, sourcePub);
+      if (!consistency.consistent) {
+        throw new Error(`Consistency check failed: ${consistency.errors.join(' ')}`);
+      }
+
+      const payload = removeUndefined(candidate);
+      await setDoc(docRef, payload);
+
+      setDcmDailyPublications((prev) => {
+        const filtered = prev.filter((item) => item.id !== candidate.id);
+        return [candidate, ...filtered].sort(
+          (a, b) => getDcmChronoTimestamp(b) - getDcmChronoTimestamp(a)
+        );
+      });
+
+      return candidate;
+    } catch (err) {
+      console.error('Error saving daily DCM publication:', err);
+      handleFirestoreError(err, OperationType.WRITE, docPath);
+      throw err;
+    }
+  };
+
+  const deleteDailyDcmPublication = async (id: string): Promise<void> => {
+    const currentUser = auth.currentUser;
+    if (!currentUser) {
+      throw new Error('Unauthorised: You must be signed in as an authorised AEO administrator to delete daily drafts.');
+    }
+    const authCheck = await checkIsAdminUser(currentUser);
+    if (!authCheck.isAuthorized) {
+      throw new Error(authCheck.reason || 'Unauthorised: Administrator privileges are required.');
+    }
+
+    const docPath = `dcm_daily_publications/${id}`;
+    const docRef = doc(db, 'dcm_daily_publications', id);
+
+    try {
+      const existingSnap = await getDoc(docRef);
+      if (existingSnap.exists()) {
+        const existingDoc = existingSnap.data() as DcmPublication;
+        if (existingDoc.status === 'published') {
+          throw new Error(
+            `Historical protection: Published daily edition "${id}" cannot be deleted.`
+          );
+        }
+      }
+
+      await deleteDoc(docRef);
+      setDcmDailyPublications((prev) => prev.filter((item) => item.id !== id));
+    } catch (err) {
+      console.error('Error deleting daily DCM publication:', err);
+      handleFirestoreError(err, OperationType.DELETE, docPath);
+      throw err;
+    }
+  };
+
+  // =========================================================================
+  // STAGE 3: PUBLIC EVIDENCE, INCIDENT HISTORY & CONFIDENTIAL NOTES HANDLERS
+  // Never automatically changes any state's DCM map classification or colour.
+  // =========================================================================
+
+  const requireAuthorizedAdmin = async (actionLabel: string) => {
+    const currentUser = auth.currentUser;
+    if (!currentUser) {
+      throw new Error(`Unauthorised: You must be signed in as an authorised AEO administrator to ${actionLabel}.`);
+    }
+    const authCheck = await checkIsAdminUser(currentUser);
+    if (!authCheck.isAuthorized) {
+      throw new Error(authCheck.reason || `Unauthorised: Administrator privileges are required to ${actionLabel}.`);
+    }
+    return currentUser;
+  };
+
+  const stampAdminApproval = (
+    approval: DcmEvidenceRecord['approvalRecord'],
+    currentUser: { uid: string; email?: string | null },
+    nowIso: string
+  ) => {
+    if (!approval) return undefined;
+    return {
+      ...approval,
+      approvalReference: (approval.approvalReference || '').trim(),
+      approvedByName: (approval.approvedByName || '').trim(),
+      recordedByUid: currentUser.uid,
+      recordedByEmail: currentUser.email || undefined,
+      recordedAt: approval.recordedAt || nowIso,
+      approvedByUid: currentUser.uid,
+      approvedByEmail: currentUser.email || undefined,
+      verificationMode: 'admin-recorded-reference' as const
+    };
+  };
+
+  const saveDcmEvidence = async (record: DcmEvidenceRecord): Promise<DcmEvidenceRecord> => {
+    const currentUser = await requireAuthorizedAdmin('save or publish evidence records');
+    const docPath = `dcm_evidence/${record.id}`;
+    const docRef = doc(db, 'dcm_evidence', record.id);
+
+    try {
+      const existingSnap = await getDoc(docRef);
+      const existingDoc = existingSnap.exists() ? (existingSnap.data() as DcmEvidenceRecord) : null;
+      const now = Date.now();
+      const nowIso = new Date(now).toISOString();
+      const urlCheck = sanitizeExternalUrl(record.sourceUrl);
+      if (!urlCheck.valid) {
+        throw new Error(urlCheck.error || 'Invalid source URL.');
+      }
+
+      const candidate: DcmEvidenceRecord = {
+        ...record,
+        sourceUrl: urlCheck.sanitizedUrl || '',
+        documentReference: (record.documentReference || '').trim() || undefined,
+        incidentId: (record.incidentId || '').trim() || undefined,
+        linkedPublicationIds: Array.isArray(record.linkedPublicationIds) ? record.linkedPublicationIds.filter(Boolean) : [],
+        approvalRecord: stampAdminApproval(record.approvalRecord, currentUser, nowIso),
+        revisionNumber: record.revisionNumber || 1,
+        publishedAt: record.status === 'published' ? record.publishedAt || nowIso : record.publishedAt,
+        createdAt: existingDoc?.createdAt || record.createdAt || now,
+        updatedAt: now,
+        createdByUid: existingDoc?.createdByUid || record.createdByUid || currentUser.uid,
+        updatedByUid: currentUser.uid
+      };
+
+      const validation = validateEvidenceRecord(candidate, {
+        isAuthorizedAdmin: true,
+        actorUid: currentUser.uid,
+        existingDoc
+      });
+      if (!validation.valid) {
+        throw new Error(validation.errors.join(' '));
+      }
+
+      await setDoc(docRef, removeUndefined(candidate));
+      setDcmEvidence((prev) => {
+        const filtered = prev.filter((item) => item.id !== candidate.id);
+        return [candidate, ...filtered].sort((a, b) =>
+          (b.sourcePublicationDate || '').localeCompare(a.sourcePublicationDate || '')
+        );
+      });
+      return candidate;
+    } catch (err) {
+      console.error('Error saving DCM evidence record:', err);
+      handleFirestoreError(err, OperationType.WRITE, docPath);
+      throw err;
+    }
+  };
+
+  const deleteDcmEvidence = async (id: string): Promise<void> => {
+    await requireAuthorizedAdmin('delete evidence drafts');
+    const docPath = `dcm_evidence/${id}`;
+    const docRef = doc(db, 'dcm_evidence', id);
+    try {
+      const existingSnap = await getDoc(docRef);
+      if (existingSnap.exists() && (existingSnap.data() as DcmEvidenceRecord).status === 'published') {
+        throw new Error(`Historical protection: Published evidence record "${id}" cannot be deleted.`);
+      }
+      await deleteDoc(docRef);
+      setDcmEvidence((prev) => prev.filter((item) => item.id !== id));
+    } catch (err) {
+      console.error('Error deleting DCM evidence record:', err);
+      handleFirestoreError(err, OperationType.DELETE, docPath);
+      throw err;
+    }
+  };
+
+  const saveDcmIncident = async (record: DcmIncidentRecord): Promise<DcmIncidentRecord> => {
+    const currentUser = await requireAuthorizedAdmin('save or publish incident records');
+    const docPath = `dcm_incidents/${record.id}`;
+    const docRef = doc(db, 'dcm_incidents', record.id);
+
+    try {
+      const existingSnap = await getDoc(docRef);
+      const existingDoc = existingSnap.exists() ? (existingSnap.data() as DcmIncidentRecord) : null;
+      const now = Date.now();
+      const nowIso = new Date(now).toISOString();
+
+      const candidate: DcmIncidentRecord = {
+        ...record,
+        linkedPublicationIds: Array.isArray(record.linkedPublicationIds) ? record.linkedPublicationIds.filter(Boolean) : [],
+        approvalRecord: stampAdminApproval(record.approvalRecord, currentUser, nowIso),
+        revisionNumber: record.revisionNumber || 1,
+        publishedAt: record.status === 'published' ? record.publishedAt || nowIso : record.publishedAt,
+        createdAt: existingDoc?.createdAt || record.createdAt || now,
+        updatedAt: now,
+        createdByUid: existingDoc?.createdByUid || record.createdByUid || currentUser.uid,
+        updatedByUid: currentUser.uid
+      };
+
+      const validation = validateIncidentRecord(candidate, {
+        isAuthorizedAdmin: true,
+        actorUid: currentUser.uid,
+        existingDoc
+      });
+      if (!validation.valid) {
+        throw new Error(validation.errors.join(' '));
+      }
+
+      await setDoc(docRef, removeUndefined(candidate));
+      setDcmIncidents((prev) => {
+        const filtered = prev.filter((item) => item.id !== candidate.id);
+        return [candidate, ...filtered].sort((a, b) =>
+          (b.firstReportedDate || '').localeCompare(a.firstReportedDate || '')
+        );
+      });
+      return candidate;
+    } catch (err) {
+      console.error('Error saving DCM incident record:', err);
+      handleFirestoreError(err, OperationType.WRITE, docPath);
+      throw err;
+    }
+  };
+
+  const deleteDcmIncident = async (id: string): Promise<void> => {
+    await requireAuthorizedAdmin('delete incident drafts');
+    const docPath = `dcm_incidents/${id}`;
+    const docRef = doc(db, 'dcm_incidents', id);
+    try {
+      const existingSnap = await getDoc(docRef);
+      if (existingSnap.exists() && (existingSnap.data() as DcmIncidentRecord).status === 'published') {
+        throw new Error(`Historical protection: Published incident record "${id}" cannot be deleted.`);
+      }
+      await deleteDoc(docRef);
+      setDcmIncidents((prev) => prev.filter((item) => item.id !== id));
+    } catch (err) {
+      console.error('Error deleting DCM incident record:', err);
+      handleFirestoreError(err, OperationType.DELETE, docPath);
+      throw err;
+    }
+  };
+
+  const saveDcmIncidentDevelopment = async (
+    record: DcmIncidentDevelopment
+  ): Promise<DcmIncidentDevelopment> => {
+    const currentUser = await requireAuthorizedAdmin('save or publish incident developments');
+    const docPath = `dcm_incident_developments/${record.id}`;
+    const docRef = doc(db, 'dcm_incident_developments', record.id);
+
+    try {
+      const existingSnap = await getDoc(docRef);
+      const existingDoc = existingSnap.exists() ? (existingSnap.data() as DcmIncidentDevelopment) : null;
+      const now = Date.now();
+      const nowIso = new Date(now).toISOString();
+
+      const sanitizedRefs = (record.sourceReferences || []).map((ref) => {
+        const check = sanitizeExternalUrl(ref.url);
+        if (!check.valid) throw new Error(check.error || 'Invalid source URL on development.');
+        return {
+          sourceName: (ref.sourceName || '').trim(),
+          publicationDate: ref.publicationDate,
+          ...(check.sanitizedUrl ? { url: check.sanitizedUrl } : {}),
+          ...(ref.documentReference?.trim() ? { documentReference: ref.documentReference.trim() } : {})
+        };
+      });
+
+      const candidate: DcmIncidentDevelopment = {
+        ...record,
+        sourceReferences: sanitizedRefs,
+        linkedEvidenceIds: Array.isArray(record.linkedEvidenceIds) ? record.linkedEvidenceIds.filter(Boolean) : undefined,
+        linkedPublicationIds: Array.isArray(record.linkedPublicationIds) ? record.linkedPublicationIds.filter(Boolean) : undefined,
+        approvalRecord: stampAdminApproval(record.approvalRecord, currentUser, nowIso),
+        revisionNumber: record.revisionNumber || 1,
+        publishedAt: record.status === 'published' ? record.publishedAt || nowIso : record.publishedAt,
+        createdAt: existingDoc?.createdAt || record.createdAt || now,
+        updatedAt: now,
+        createdByUid: existingDoc?.createdByUid || record.createdByUid || currentUser.uid,
+        updatedByUid: currentUser.uid
+      };
+
+      const validation = validateIncidentDevelopment(candidate, {
+        isAuthorizedAdmin: true,
+        actorUid: currentUser.uid,
+        existingDoc
+      });
+      if (!validation.valid) {
+        throw new Error(validation.errors.join(' '));
+      }
+
+      await setDoc(docRef, removeUndefined(candidate));
+      setDcmIncidentDevelopments((prev) => {
+        const filtered = prev.filter((item) => item.id !== candidate.id);
+        return [candidate, ...filtered].sort((a, b) =>
+          (a.developmentDate || '').localeCompare(b.developmentDate || '')
+        );
+      });
+      return candidate;
+    } catch (err) {
+      console.error('Error saving DCM incident development:', err);
+      handleFirestoreError(err, OperationType.WRITE, docPath);
+      throw err;
+    }
+  };
+
+  const deleteDcmIncidentDevelopment = async (id: string): Promise<void> => {
+    await requireAuthorizedAdmin('delete incident development drafts');
+    const docPath = `dcm_incident_developments/${id}`;
+    const docRef = doc(db, 'dcm_incident_developments', id);
+    try {
+      const existingSnap = await getDoc(docRef);
+      if (existingSnap.exists() && (existingSnap.data() as DcmIncidentDevelopment).status === 'published') {
+        throw new Error(`Historical protection: Published incident development "${id}" cannot be deleted.`);
+      }
+      await deleteDoc(docRef);
+      setDcmIncidentDevelopments((prev) => prev.filter((item) => item.id !== id));
+    } catch (err) {
+      console.error('Error deleting DCM incident development:', err);
+      handleFirestoreError(err, OperationType.DELETE, docPath);
+      throw err;
+    }
+  };
+
+  const saveDcmPrivateNote = async (note: DcmPrivateNoteRecord): Promise<DcmPrivateNoteRecord> => {
+    const currentUser = await requireAuthorizedAdmin('save confidential notes');
+    const docPath = `dcm_private_notes/${note.id}`;
+    const docRef = doc(db, 'dcm_private_notes', note.id);
+
+    try {
+      const existingSnap = await getDoc(docRef);
+      const existingDoc = existingSnap.exists() ? (existingSnap.data() as DcmPrivateNoteRecord) : null;
+      const now = Date.now();
+      const candidate: DcmPrivateNoteRecord = {
+        ...note,
+        confidentialNotes: (note.confidentialNotes || '').trim(),
+        confidentialContacts: (note.confidentialContacts || '').trim() || undefined,
+        unverifiedLeads: (note.unverifiedLeads || '').trim() || undefined,
+        createdAt: existingDoc?.createdAt || note.createdAt || now,
+        updatedAt: now,
+        createdByUid: existingDoc?.createdByUid || currentUser.uid,
+        updatedByUid: currentUser.uid
+      };
+
+      const validation = validatePrivateNoteRecord(candidate, {
+        isAuthorizedAdmin: true,
+        actorUid: currentUser.uid
+      });
+      if (!validation.valid) {
+        throw new Error(validation.errors.join(' '));
+      }
+
+      await setDoc(docRef, removeUndefined(candidate));
+      setDcmPrivateNotes((prev) => {
+        const filtered = prev.filter((item) => item.id !== candidate.id);
+        return [candidate, ...filtered].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+      });
+      return candidate;
+    } catch (err) {
+      console.error('Error saving confidential DCM note:', err);
+      handleFirestoreError(err, OperationType.WRITE, docPath);
+      throw err;
+    }
+  };
+
+  const deleteDcmPrivateNote = async (id: string): Promise<void> => {
+    await requireAuthorizedAdmin('delete confidential notes');
+    const docPath = `dcm_private_notes/${id}`;
+    try {
+      await deleteDoc(doc(db, 'dcm_private_notes', id));
+      setDcmPrivateNotes((prev) => prev.filter((item) => item.id !== id));
+    } catch (err) {
+      console.error('Error deleting confidential DCM note:', err);
+      handleFirestoreError(err, OperationType.DELETE, docPath);
       throw err;
     }
   };
@@ -1273,9 +2298,36 @@ export function CMSProvider({ children }: { children: ReactNode }) {
       if (teamSnap.exists() && Array.isArray(teamSnap.data()?.items)) {
         setTeam(teamSnap.data()?.items);
       }
-      const dcmSnap = await getDoc(doc(db, 'cms', 'dcm_publications'));
+      const legacyRefreshDocId = isAdminViewer ? 'dcm_publications' : 'dcm_publications_public';
+      const dcmSnap = await getDoc(doc(db, 'cms', legacyRefreshDocId));
       if (dcmSnap.exists() && Array.isArray(dcmSnap.data()?.items)) {
-        setDcmPublications(dcmSnap.data()?.items);
+        const rawItems = dcmSnap.data()!.items as DcmPublication[];
+        setDcmLegacyPublications(
+          isAdminViewer ? rawItems : rawItems.filter((p) => p && p.status === 'published')
+        );
+      }
+      try {
+        const dailyCol = collection(db, 'dcm_daily_publications');
+        const dailyQuery = isAdminViewer
+          ? dailyCol
+          : query(
+              dailyCol,
+              where('status', '==', 'published'),
+              orderBy('assessmentDate', 'desc'),
+              limit(DAILY_ARCHIVE_INITIAL_WINDOW)
+            );
+        const dailySnap = await getDocs(dailyQuery);
+        const dailyItems: DcmPublication[] = [];
+        dailySnap.forEach((d) => {
+          const data = d.data() as DcmPublication;
+          if (data && data.id) {
+            dailyItems.push({ ...data, publicationFormat: 'daily' });
+          }
+        });
+        dailyItems.sort((a, b) => getDcmChronoTimestamp(b) - getDcmChronoTimestamp(a));
+        setDcmDailyPublications(dailyItems);
+      } catch (dailyErr) {
+        console.warn('Notice refreshing dcm_daily_publications:', dailyErr);
       }
     } catch (e) {
       console.warn('Error refreshing cloud data:', e);
@@ -1286,7 +2338,7 @@ export function CMSProvider({ children }: { children: ReactNode }) {
   // Export entire CMS data as formatted JSON string
   const exportAllDataJson = useCallback(() => {
     const backupObj = {
-      version: 1,
+      version: 2,
       exportedAt: new Date().toISOString(),
       reports,
       weekly,
@@ -1299,10 +2351,11 @@ export function CMSProvider({ children }: { children: ReactNode }) {
       team,
       heroConfig,
       statsConfig,
-      dcmPublications
+      dcmPublications: dcmLegacyPublications,
+      dcmDailyPublications
     };
     return JSON.stringify(backupObj, null, 2);
-  }, [reports, weekly, announcements, diaryNat, diaryLoc, diaryAfr, diaryOth, events, team, heroConfig, statsConfig, dcmPublications]);
+  }, [reports, weekly, announcements, diaryNat, diaryLoc, diaryAfr, diaryOth, events, team, heroConfig, statsConfig, dcmLegacyPublications, dcmDailyPublications]);
 
   // Import entire CMS data from JSON string with Super Admin UID check, schema validation, and double confirmation
   const importDataJson = async (jsonStr: string, confirmationPhrase?: string): Promise<{ success: boolean; message: string }> => {
@@ -1396,10 +2449,20 @@ export function CMSProvider({ children }: { children: ReactNode }) {
         await setDoc(doc(db, 'cms', 'stats'), removeUndefined({ items: validStats, updatedAt: Date.now() }));
       }
 
-      const validDcm = validateItems(parsed.dcmPublications, ['id', 'title']);
+      const validDcm = validateItems(parsed.dcmPublications, ['id', 'title']).filter(
+        (item: any) => item.publicationFormat !== 'daily'
+      );
       if (validDcm.length > 0) {
-        setDcmPublications(validDcm);
-        await setDoc(doc(db, 'cms', 'dcm_publications'), removeUndefined({ items: validDcm, updatedAt: Date.now() }));
+        setDcmLegacyPublications(validDcm);
+        const tsNow = Date.now();
+        await setDoc(doc(db, 'cms', 'dcm_publications'), removeUndefined({ items: validDcm, updatedAt: tsNow }));
+        await setDoc(
+          doc(db, 'cms', 'dcm_publications_public'),
+          removeUndefined({
+            items: validDcm.filter((p: any) => p && p.status === 'published'),
+            updatedAt: tsNow
+          })
+        );
         count += validDcm.length;
       }
 
@@ -1418,6 +2481,325 @@ export function CMSProvider({ children }: { children: ReactNode }) {
   };
 
 
+  // Stage 5: On-demand O(1) fetch for a deep historical daily publication permalink
+  const loadDcmPublicationById = useCallback(async (publicationId: string): Promise<DcmPublication | null> => {
+    const cleanId = (publicationId || '').trim();
+    if (!cleanId) return null;
+    try {
+      const snap = await getDoc(doc(db, 'dcm_daily_publications', cleanId));
+      if (!snap.exists()) return null;
+      const data = snap.data() as DcmPublication;
+      if (!data || !data.id) return null;
+      // Strict public privacy enforcement: non-admin visitors can only ever receive published records
+      if (!isAdminViewer && data.status !== 'published') return null;
+      const normalized: DcmPublication = { ...data, publicationFormat: 'daily' };
+      setDcmDailyPublications((prev) => {
+        if (prev.some((p) => p.id === normalized.id)) return prev;
+        const merged = [...prev, normalized];
+        merged.sort((a, b) => getDcmChronoTimestamp(b) - getDcmChronoTimestamp(a));
+        return merged;
+      });
+      return normalized;
+    } catch (err: any) {
+      console.warn(`On-demand DCM publication load notice for ${cleanId}:`, err?.message || err);
+      return null;
+    }
+  }, [isAdminViewer]);
+
+  // Stage 5, 6 & 7: Strictly bounded date-scoped on-demand fetch for an archive month ordered newest-first.
+  // Never performs an unbounded fallback; surfaces accurate error state if required composite index is missing.
+  const loadDcmArchiveMonth = useCallback(async (year: number, month: number): Promise<DcmPublication[]> => {
+    try {
+      const dailyCol = collection(db, 'dcm_daily_publications');
+      const indexedMonthQuery = query(
+        dailyCol,
+        where('status', '==', 'published'),
+        where('year', '==', year),
+        where('month', '==', month),
+        orderBy('assessmentDate', 'desc'),
+        limit(62)
+      );
+      const snap = await getDocs(indexedMonthQuery);
+      const loaded: DcmPublication[] = [];
+      snap.forEach((docSnap) => {
+        const data = docSnap.data() as DcmPublication;
+        if (data && data.id && data.status === 'published') {
+          loaded.push({ ...data, publicationFormat: 'daily' });
+        }
+      });
+      loaded.sort((a, b) => getDcmChronoTimestamp(b) - getDcmChronoTimestamp(a));
+      if (loaded.length > 0) {
+        setDcmDailyPublications((prev) => {
+          const byId = new Map<string, DcmPublication>();
+          for (const existing of prev) byId.set(existing.id, existing);
+          for (const item of loaded) byId.set(item.id, item);
+          const merged = Array.from(byId.values());
+          merged.sort((a, b) => getDcmChronoTimestamp(b) - getDcmChronoTimestamp(a));
+          return merged;
+        });
+      }
+      return loaded;
+    } catch (err: any) {
+      const isMissingIndex =
+        err?.code === 'failed-precondition' ||
+        String(err?.message || '').toLowerCase().includes('index');
+      if (isMissingIndex) {
+        const requiredIndex = 'dcm_daily_publications (status ASC, year ASC, month ASC, assessmentDate DESC)';
+        setDcmArchiveError({
+          code: 'missing-index',
+          collection: 'dcm_daily_publications',
+          message: `Month-scoped archive lookup for ${year}-${String(month).padStart(2, '0')} requires composite index ${requiredIndex}.`,
+          requiredIndex,
+          canRetry: true,
+          failedAtIso: new Date().toISOString()
+        });
+      }
+      console.warn(`Date-scoped DCM archive load notice for ${year}-${month}:`, err?.message || err);
+      return [];
+    }
+  }, []);
+
+  // Stage 6 & 7: Strictly bounded cursor-based chronological pagination for loading older daily editions beyond 60.
+  // Uses QueryDocumentSnapshot cursor (startAfter(lastDocSnap)) when available so same-date revisions (-r1 / -r2)
+  // straddling a page boundary are NEVER skipped; never executes an unbounded collection scan.
+  const loadOlderDailyPublications = useCallback(
+    async (
+      beforeAssessmentDate?: string,
+      pageSize: number = DAILY_ARCHIVE_INITIAL_WINDOW
+    ): Promise<DcmPublication[]> => {
+      const boundedLimit = Math.max(1, Math.min(120, pageSize));
+      const cleanCursor = (beforeAssessmentDate || '').trim();
+      const docCursor = lastDailyDocSnapRef.current;
+      if (!docCursor && !/^\d{4}-\d{2}-\d{2}$/.test(cleanCursor)) return [];
+
+      try {
+        const dailyCol = collection(db, 'dcm_daily_publications');
+        const paginatedQuery = docCursor
+          ? query(
+              dailyCol,
+              where('status', '==', 'published'),
+              orderBy('assessmentDate', 'desc'),
+              startAfter(docCursor),
+              limit(boundedLimit)
+            )
+          : query(
+              dailyCol,
+              where('status', '==', 'published'),
+              orderBy('assessmentDate', 'desc'),
+              startAfter(cleanCursor),
+              limit(boundedLimit)
+            );
+        const snap = await getDocs(paginatedQuery);
+
+        const docs = snap.docs || [];
+        if (docs.length > 0) {
+          lastDailyDocSnapRef.current = docs[docs.length - 1];
+        }
+        setDcmDailyHasMore(docs.length >= boundedLimit);
+
+        const loaded: DcmPublication[] = [];
+        snap.forEach((docSnap) => {
+          const data = docSnap.data() as DcmPublication;
+          if (!data || !data.id || data.status !== 'published') return;
+          loaded.push({ ...data, publicationFormat: 'daily' });
+        });
+        loaded.sort((a, b) => getDcmChronoTimestamp(b) - getDcmChronoTimestamp(a));
+
+        if (loaded.length > 0) {
+          setDcmDailyPublications((prev) => {
+            const byId = new Map<string, DcmPublication>();
+            for (const existing of prev) byId.set(existing.id, existing);
+            for (const item of loaded) byId.set(item.id, item);
+            const merged = Array.from(byId.values());
+            merged.sort((a, b) => getDcmChronoTimestamp(b) - getDcmChronoTimestamp(a));
+            return merged;
+          });
+        }
+        return loaded;
+      } catch (err: any) {
+        const isMissingIndex =
+          err?.code === 'failed-precondition' ||
+          String(err?.message || '').toLowerCase().includes('index');
+        if (isMissingIndex) {
+          const requiredIndex = 'dcm_daily_publications (status ASC, assessmentDate DESC)';
+          setDcmArchiveError({
+            code: 'missing-index',
+            collection: 'dcm_daily_publications',
+            message: `Older daily archive pagination requires composite index ${requiredIndex}.`,
+            requiredIndex,
+            canRetry: true,
+            failedAtIso: new Date().toISOString()
+          });
+        }
+        console.warn(`Paginated older daily archive load notice:`, err?.message || err);
+        return [];
+      }
+    },
+    []
+  );
+
+  // Stage 5, 6 & 7: Strictly bounded state-scoped on-demand fetch for historical public evidence & incidents.
+  // Never performs an unbounded fallback; reports accurate error state if composite index is missing.
+  const loadDcmStateEvidence = useCallback(async (stateCode: string): Promise<void> => {
+    const cleanCode = (stateCode || '').trim().toUpperCase();
+    if (!cleanCode) return;
+
+    const getOrderedStateDocs = async (colName: string, orderField: string, maxItems: number) => {
+      const colRef = collection(db, colName);
+      return await getDocs(
+        query(
+          colRef,
+          where('status', '==', 'published'),
+          where('visibility', '==', 'public'),
+          where('stateCode', '==', cleanCode),
+          orderBy(orderField, 'desc'),
+          limit(maxItems)
+        )
+      );
+    };
+
+    try {
+      const [evSnap, incSnap, devSnap] = await Promise.all([
+        getOrderedStateDocs('dcm_evidence', 'sourcePublicationDate', 100),
+        getOrderedStateDocs('dcm_incidents', 'firstReportedDate', 100),
+        getOrderedStateDocs('dcm_incident_developments', 'developmentDate', 200)
+      ]);
+
+      const loadedEv: DcmEvidenceRecord[] = [];
+      evSnap.forEach((d) => {
+        const item = d.data() as DcmEvidenceRecord;
+        if (item?.id && item.status === 'published' && item.visibility === 'public') loadedEv.push(item);
+      });
+      if (loadedEv.length > 0) {
+        setDcmEvidence((prev) => {
+          const byId = new Map(prev.map((x) => [x.id, x]));
+          for (const item of loadedEv) byId.set(item.id, item);
+          return Array.from(byId.values()).sort((a, b) =>
+            (b.sourcePublicationDate || '').localeCompare(a.sourcePublicationDate || '')
+          );
+        });
+      }
+
+      const loadedInc: DcmIncidentRecord[] = [];
+      incSnap.forEach((d) => {
+        const item = d.data() as DcmIncidentRecord;
+        if (item?.id && item.status === 'published' && item.visibility === 'public') loadedInc.push(item);
+      });
+      if (loadedInc.length > 0) {
+        setDcmIncidents((prev) => {
+          const byId = new Map(prev.map((x) => [x.id, x]));
+          for (const item of loadedInc) byId.set(item.id, item);
+          return Array.from(byId.values()).sort((a, b) =>
+            (b.firstReportedDate || '').localeCompare(a.firstReportedDate || '')
+          );
+        });
+      }
+
+      const loadedDev: DcmIncidentDevelopment[] = [];
+      devSnap.forEach((d) => {
+        const item = d.data() as DcmIncidentDevelopment;
+        if (item?.id && item.status === 'published' && item.visibility === 'public') loadedDev.push(item);
+      });
+      if (loadedDev.length > 0) {
+        setDcmIncidentDevelopments((prev) => {
+          const byId = new Map(prev.map((x) => [x.id, x]));
+          for (const item of loadedDev) byId.set(item.id, item);
+          return Array.from(byId.values()).sort((a, b) =>
+            (a.developmentDate || '').localeCompare(b.developmentDate || '')
+          );
+        });
+      }
+    } catch (err: any) {
+      console.warn(`State-scoped DCM evidence load notice for ${cleanCode}:`, err?.message || err);
+    }
+  }, []);
+
+  // Stage 6: Admin-only Editorial Handover persistence (immutable source snapshot)
+  const saveDcmEditorialHandover = useCallback(
+    async (record: DcmEditorialHandoverRecord): Promise<DcmEditorialHandoverRecord> => {
+      const currentUser = auth.currentUser;
+      const adminCheck = currentUser ? await checkIsAdminUser(currentUser) : null;
+      const isAdmin = Boolean(adminCheck?.isAuthorized);
+      const sourcePub = dcmPublications.find((p) => p.id === record.publicationId);
+
+      const validation = validateEditorialHandoverRecord(record, {
+        isAuthorizedAdmin: isAdmin,
+        actorUid: currentUser?.uid,
+        sourcePublicationStatus: sourcePub?.status || 'draft'
+      });
+      if (!validation.valid) {
+        throw new Error(validation.errors.join(' '));
+      }
+
+      const nowMs = Date.now();
+      const sanitizedRecord: DcmEditorialHandoverRecord = removeUndefined({
+        ...record,
+        preparedByUid: currentUser!.uid,
+        createdByUid: currentUser!.uid,
+        updatedByUid: currentUser!.uid,
+        createdAt: record.createdAt || nowMs,
+        updatedAt: nowMs
+      });
+
+      const docRef = doc(db, 'dcm_editorial_handovers', sanitizedRecord.id);
+      await setDoc(docRef, sanitizedRecord);
+
+      setDcmEditorialHandovers((prev) => {
+        const next = [sanitizedRecord, ...prev.filter((h) => h.id !== sanitizedRecord.id)];
+        next.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        return next;
+      });
+
+      return sanitizedRecord;
+    },
+    [dcmPublications]
+  );
+
+  const updateDcmEditorialHandoverStatus = useCallback(
+    async (
+      handoverId: string,
+      handoverStatus: DcmEditorialHandoverStatus,
+      recipientTeam?: string
+    ): Promise<DcmEditorialHandoverRecord> => {
+      const currentUser = auth.currentUser;
+      const adminCheck = currentUser ? await checkIsAdminUser(currentUser) : null;
+      const isAdmin = Boolean(adminCheck?.isAuthorized);
+      if (!isAdmin || !currentUser) {
+        throw new Error('Only signed-in authorised AEO administrators may update editorial handover status.');
+      }
+
+      const docRef = doc(db, 'dcm_editorial_handovers', handoverId);
+      const snap = await getDoc(docRef);
+      if (!snap.exists()) {
+        throw new Error(`Editorial handover record "${handoverId}" was not found.`);
+      }
+      const existing = snap.data() as DcmEditorialHandoverRecord;
+      const updated: DcmEditorialHandoverRecord = removeUndefined({
+        ...existing,
+        handoverStatus,
+        ...(recipientTeam !== undefined
+          ? recipientTeam.trim()
+            ? { recipientTeam: recipientTeam.trim() }
+            : {}
+          : existing.recipientTeam
+          ? { recipientTeam: existing.recipientTeam }
+          : {}),
+        updatedAt: Date.now(),
+        updatedByUid: currentUser.uid
+      });
+      if (recipientTeam !== undefined && !recipientTeam.trim()) {
+        delete (updated as any).recipientTeam;
+      }
+
+      await setDoc(docRef, updated);
+      setDcmEditorialHandovers((prev) =>
+        prev.map((h) => (h.id === handoverId ? updated : h))
+      );
+      return updated;
+    },
+    []
+  );
+
   return (
     <CMSContext.Provider value={{
       reports,
@@ -1432,8 +2814,35 @@ export function CMSProvider({ children }: { children: ReactNode }) {
       heroConfig,
       statsConfig,
       dcmPublications,
+      dcmLegacyPublications,
+      dcmDailyPublications,
       saveDcmPublication,
       deleteDcmPublication,
+      saveDailyDcmPublication,
+      deleteDailyDcmPublication,
+      dcmEvidence,
+      dcmIncidents,
+      dcmIncidentDevelopments,
+      dcmPrivateNotes,
+      saveDcmEvidence,
+      deleteDcmEvidence,
+      saveDcmIncident,
+      deleteDcmIncident,
+      saveDcmIncidentDevelopment,
+      deleteDcmIncidentDevelopment,
+      saveDcmPrivateNote,
+      deleteDcmPrivateNote,
+      dcmArchiveQueryMode,
+      dcmArchiveError,
+      dcmDailyHasMore,
+      retryDcmArchiveQueries,
+      loadDcmPublicationById,
+      loadDcmArchiveMonth,
+      loadOlderDailyPublications,
+      loadDcmStateEvidence,
+      dcmEditorialHandovers,
+      saveDcmEditorialHandover,
+      updateDcmEditorialHandoverStatus,
       apeaAudits,
       apeaPublicReports,
       apeaReportInfo,

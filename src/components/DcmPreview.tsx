@@ -1,16 +1,53 @@
 import React, { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import { DCM_GEO } from '../data/dcmGeoData';
 
-// Classification Categories and Palette
+import { useCMS } from '../context/CMSContext';
+import { INITIAL_DCM_PUBLICATIONS } from '../data/dcmInitialData';
+import { DcmPublication } from '../types/dcm';
+import { formatDailyDateLabel } from '../utils/dcmDaily';
+import {
+  buildCanonicalPublicationView,
+  CanonicalPublicationView,
+  CanonicalStateView,
+  DCM_CANONICAL_CODES,
+  DCM_CANONICAL_PALETTE,
+  DCM_DIRECTION_LABELS,
+  resolveJurisdictionMeta,
+  resolvePublicDcmPublications,
+  resolveSelectedPublication,
+  TRANSPARENT_CARRIED_FORWARD_NO_NOTE,
+  TRANSPARENT_MISSING_CLASSIFICATION_NOTE,
+  TRANSPARENT_MISSING_EVIDENCE_NOTE
+} from '../utils/dcmConsistency';
+import { AlertCircle, ChevronDown, ChevronUp, ExternalLink, GitBranch } from 'lucide-react';
+import { resolveStateAssessmentPanelData } from '../utils/dcmEvidence';
+import { DcmStateAssessmentPanel } from './DcmStateAssessmentPanel';
+import { DcmArchiveSection } from './DcmArchiveSection';
+import {
+  buildUnifiedPublicationOptions,
+  DCM_LEGEND_DEFINITIONS,
+  INSUFFICIENT_EVIDENCE_DISCLAIMER,
+  MAP_SELECTION_INSTRUCTION,
+  resolveDailyUpdateBanner
+} from '../utils/dcmMobile';
+import {
+  buildAbsoluteDcmPermalink,
+  buildDcmPermalinkUrl,
+  resolveDcmPermalink,
+  resolvePublicationCorrectionChain
+} from '../utils/dcmArchive';
+
+// Classification Categories and Palette (sourced from canonical palette)
 export const DCM_CAT: Record<string, { name: string; hex: string }> = {
-  G: { name: 'Open', hex: '#3e9a62' },
-  A: { name: 'Emerging concern', hex: '#f6cd5c' },
-  O: { name: 'Constrained', hex: '#e5822a' },
-  R: { name: 'Severely constrained', hex: '#8f1d17' },
-  X: { name: 'Insufficient evidence', hex: '#c9cdd2' }
+  G: { name: DCM_CANONICAL_PALETTE.G.name, hex: DCM_CANONICAL_PALETTE.G.hex },
+  A: { name: DCM_CANONICAL_PALETTE.A.name, hex: DCM_CANONICAL_PALETTE.A.hex },
+  O: { name: DCM_CANONICAL_PALETTE.O.name, hex: DCM_CANONICAL_PALETTE.O.hex },
+  R: { name: DCM_CANONICAL_PALETTE.R.name, hex: DCM_CANONICAL_PALETTE.R.hex },
+  X: { name: DCM_CANONICAL_PALETTE.X.name, hex: DCM_CANONICAL_PALETTE.X.hex },
+  U: { name: DCM_CANONICAL_PALETTE.U.name, hex: DCM_CANONICAL_PALETTE.U.hex }
 };
 
-export const DCM_ORDER = ['G', 'A', 'O', 'R', 'X'];
+export const DCM_ORDER = DCM_CANONICAL_CODES;
 
 export const DCM_MONTHS = [
   'January', 'February', 'March', 'April', 'May', 'June',
@@ -50,8 +87,10 @@ export const DCM_P2 = dcmWith(DCM_P1, {
 export interface DcmStateDetail {
   keyFinding?: string;
   confidence?: 'High' | 'Medium' | 'Low' | string;
-  direction?: 'newly-classified' | 'deteriorating' | 'improving' | 'stable' | 'insufficient-basis' | string;
+  direction?: 'newly-classified' | 'deteriorating' | 'improving' | 'stable' | 'unchanged' | 'insufficient-basis' | string;
   rightOfResponse?: string;
+  carriedForward?: boolean;
+  lastSubstantiveReviewDate?: string;
 }
 
 export const BASELINE_DETAILS: Record<string, DcmStateDetail> = {
@@ -108,9 +147,17 @@ export const BASELINE_DETAILS: Record<string, DcmStateDetail> = {
 };
 
 export interface DcmPubItem {
+  id: string;
   year: number;
   month: number; // 0-indexed: 8 = Sept, 9 = Oct
   half: number;  // 0 = 1st-15th, 1 = 16th-end
+  publicationFormat?: 'legacy-period' | 'daily';
+  assessmentDate?: string;
+  evidenceCutoffTimeWat?: string;
+  evidenceCutoffDateTimeWat?: string;
+  publishedAt?: string;
+  isQuietDay?: boolean;
+  carriedForwardAllStates?: boolean;
   pubTitle?: string;
   label: string;
   short: string;
@@ -121,97 +168,109 @@ export interface DcmPubItem {
   changesSummary?: string;
   cls: Record<string, string>;
   details?: Record<string, DcmStateDetail>;
+  canonicalView?: CanonicalPublicationView;
+  rawPublication?: DcmPublication;
 }
 
+/**
+ * Returns state display metadata strictly from the approved publication record.
+ * Never fabricates direction from colour ranks, never fabricates confidence,
+ * never substitutes generic classification descriptions for missing findings,
+ * and displays missing classification/evidence transparently.
+ */
 export function getStateDetails(
   pub: DcmPubItem,
-  prevPub: DcmPubItem | null,
+  _prevPub: DcmPubItem | null,
   stateName: string
 ): {
+  code: string;
+  hex: string;
   classification: string;
+  isClassificationUnavailable: boolean;
   direction: string;
   rawDirection: string;
   confidence: string;
   keyFinding: string;
+  hasApprovedFinding: boolean;
   rightOfResponse: string;
+  carriedForward: boolean;
+  lastSubstantiveReviewDate: string;
 } {
+  // Primary path: pull directly from the canonical publication view (single source of truth)
+  const canonical: CanonicalStateView | undefined = pub.canonicalView?.statesByMapName[stateName];
+  if (canonical) {
+    return {
+      code: canonical.code,
+      hex: canonical.hex,
+      classification: canonical.classification,
+      isClassificationUnavailable: canonical.isClassificationUnavailable,
+      direction: canonical.directionLabel,
+      rawDirection: canonical.rawDirection,
+      confidence: canonical.confidenceLabel,
+      keyFinding: canonical.keyFinding,
+      hasApprovedFinding: canonical.hasApprovedFinding,
+      rightOfResponse: canonical.rightOfResponseLabel,
+      carriedForward: canonical.carriedForward,
+      lastSubstantiveReviewDate: canonical.lastSubstantiveReviewDate
+    };
+  }
+
+  // Fallback path for standalone DcmPubItem objects (strictly zero-fabrication)
   const explicit = pub.details?.[stateName];
-  const catCode = (pub.cls && pub.cls[stateName]) || 'X';
-  const prevCode = prevPub ? ((prevPub.cls && prevPub.cls[stateName]) || 'X') : null;
-  const catName = DCM_CAT[catCode]?.name || 'Insufficient evidence';
+  const rawCode = pub.cls && pub.cls[stateName];
+  const catCode = rawCode && DCM_CAT[rawCode] ? rawCode : 'U';
+  const catObj = DCM_CAT[catCode] || DCM_CAT.U;
+  const isUnavailable = catCode === 'U';
+  const isCarriedForward = Boolean(explicit?.carriedForward);
 
-  let direction = explicit?.direction;
-  if (!direction) {
-    if (!prevPub || prevCode === null) {
-      direction = catCode === 'X' ? 'insufficient-basis' : 'newly-classified';
-    } else if (prevCode === 'X' && catCode !== 'X') {
-      direction = 'newly-classified';
-    } else if (catCode === 'X' && prevCode !== 'X') {
-      direction = 'insufficient-basis';
-    } else {
-      const rank: Record<string, number> = { G: 1, A: 2, O: 3, R: 4, X: 0 };
-      const cRank = rank[catCode] || 0;
-      const pRank = rank[prevCode] || 0;
-      if (cRank > pRank) {
-        direction = 'deteriorating';
-      } else if (cRank < pRank && cRank > 0) {
-        direction = 'improving';
-      } else {
-        direction = 'stable';
-      }
-    }
+  if (isUnavailable) {
+    return {
+      code: 'U',
+      hex: DCM_CAT.U.hex,
+      classification: DCM_CAT.U.name,
+      isClassificationUnavailable: true,
+      direction: 'Not recorded',
+      rawDirection: '',
+      confidence: 'Not recorded',
+      keyFinding: TRANSPARENT_MISSING_CLASSIFICATION_NOTE,
+      hasApprovedFinding: false,
+      rightOfResponse: 'Not recorded',
+      carriedForward: false,
+      lastSubstantiveReviewDate: ''
+    };
   }
 
-  const directionLabels: Record<string, string> = {
-    'newly-classified': 'Newly classified',
-    'deteriorating': 'Deteriorating',
-    'insufficient-basis': 'Insufficient basis',
-    'improving': 'Improving',
-    'stable': 'Stable',
-    'unchanged': 'Unchanged'
-  };
-  const directionLabel = directionLabels[direction.toLowerCase()] || direction;
+  const rawDir = (explicit?.direction || '').trim();
+  const directionLabel = rawDir
+    ? (DCM_DIRECTION_LABELS[rawDir.toLowerCase()] || rawDir)
+    : (isCarriedForward ? 'Carried forward (unchanged)' : 'Not specified');
 
-  let confidence = explicit?.confidence;
-  if (!confidence) {
-    if (catCode === 'X') {
-      confidence = 'Low';
-    } else if (catCode === 'R' || catCode === 'O') {
-      confidence = 'High';
-    } else {
-      confidence = 'Medium';
-    }
-  }
-
-  let keyFinding = explicit?.keyFinding;
-  if (!keyFinding) {
-    if (stateName === 'Kaduna') {
-      keyFinding = 'Police confirm using tear gas at the ADC governorship launch; supporters of both main parties allege attacks.';
-    } else if (catCode === 'X') {
-      keyFinding = 'Insufficient verified evidence held by AEO to establish an open or constrained rating.';
-    } else if (catCode === 'G') {
-      keyFinding = 'Verified open access for political parties, unhindered peaceful campaign assembly, and neutral local administration.';
-    } else if (catCode === 'A') {
-      keyFinding = 'Emerging friction in campaign venue permitting, localized partisan tension, or administrative restrictions.';
-    } else if (catCode === 'O') {
-      keyFinding = 'Material obstruction of political gatherings, campaign motorcade disruptions, or interference with opposition visibility.';
-    } else if (catCode === 'R') {
-      keyFinding = 'Severe systemic suppression, physical violence against campaign secretariats, or prohibition of opposition mobilization.';
-    }
-  }
+  const confidence = (explicit?.confidence || '').trim() || 'Not specified';
+  const approvedFinding = (explicit?.keyFinding || '').trim();
+  const hasApprovedFinding = approvedFinding.length > 0;
+  const keyFinding = hasApprovedFinding
+    ? approvedFinding
+    : (isCarriedForward ? TRANSPARENT_CARRIED_FORWARD_NO_NOTE : TRANSPARENT_MISSING_EVIDENCE_NOTE);
 
   return {
-    classification: catName,
+    code: catCode,
+    hex: catObj.hex,
+    classification: catObj.name,
+    isClassificationUnavailable: false,
     direction: directionLabel,
-    rawDirection: direction,
+    rawDirection: rawDir,
     confidence,
-    keyFinding: keyFinding || 'No additional evidence recorded.',
-    rightOfResponse: explicit?.rightOfResponse || 'Requested'
+    keyFinding,
+    hasApprovedFinding,
+    rightOfResponse: (explicit?.rightOfResponse || '').trim() || 'Not specified',
+    carriedForward: isCarriedForward,
+    lastSubstantiveReviewDate: explicit?.lastSubstantiveReviewDate || ''
   };
 }
 
 export const DCM_PUBS: DcmPubItem[] = [
   {
+    id: 'legacy-pilot-2026-06',
     year: 2026,
     month: 5,
     half: 1,
@@ -226,6 +285,7 @@ export const DCM_PUBS: DcmPubItem[] = [
     details: BASELINE_DETAILS
   },
   {
+    id: 'legacy-baseline-2026-09',
     year: 2026,
     month: 8,
     half: 1,
@@ -240,6 +300,7 @@ export const DCM_PUBS: DcmPubItem[] = [
     details: BASELINE_DETAILS
   },
   {
+    id: 'legacy-oct-2026-15',
     year: 2026,
     month: 9,
     half: 0,
@@ -302,92 +363,254 @@ export const SECTORS = [
   { value: 'individual', label: 'Individual or other' }
 ];
 
-import { useCMS } from '../context/CMSContext';
-import { getPublishedDcmSorted } from '../utils/dcmComparison';
-import { NIGERIA_37_JURISDICTIONS } from '../types/dcm';
-
-const CLASS_TO_CODE: Record<string, string> = {
-  'Open': 'G',
-  'Emerging concern': 'A',
-  'Constrained': 'O',
-  'Severely constrained': 'R',
-  'Insufficient evidence': 'X'
-};
-
 export interface DcmPreviewProps {
   isEmbedded?: boolean;
   hideAside?: boolean;
 }
 
 export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hideAside = false }) => {
-  const { dcmPublications } = useCMS();
+  const {
+    dcmPublications,
+    dcmEvidence,
+    dcmIncidents,
+    dcmIncidentDevelopments,
+    dcmArchiveError,
+    retryDcmArchiveQueries,
+    loadDcmPublicationById,
+    loadDcmArchiveMonth,
+    loadDcmStateEvidence
+  } = useCMS();
 
-  // Combine dynamic published CMS publications (if available) sorted chronologically ascending
-  const allPubs: DcmPubItem[] = useMemo(() => {
-    const published = getPublishedDcmSorted(dcmPublications);
-    if (published.length > 0) {
-      return published.map((pub) => {
-        const clsMap: Record<string, string> = {};
-        const detailsMap: Record<string, DcmStateDetail> = {};
-        if (pub.classifications) {
-          for (const [code, rec] of Object.entries(pub.classifications)) {
-            const canonicalFromCode = NIGERIA_37_JURISDICTIONS.find((j) => j.code === code)?.name;
-            const rawName = rec.stateName || canonicalFromCode || code;
-            const stateName = rawName === 'Federal Capital Territory' || code === 'FC' ? 'FCT' : rawName;
-            clsMap[stateName] = CLASS_TO_CODE[rec.classification] || 'X';
-            detailsMap[stateName] = {
-              keyFinding: rec.keyFinding || rec.classificationRationale || rec.evidenceSummary || '',
-              confidence: rec.confidence || (rec.classification === 'Insufficient evidence' ? 'Low' : 'Medium'),
-              direction: rec.direction || (rec.classification === 'Insufficient evidence' ? 'insufficient-basis' : 'newly-classified'),
-              rightOfResponse: rec.rightOfResponseStatus || 'Requested'
-            };
-          }
-        }
-        const parsedMonth = Number(pub.month);
-        const monthIdx = parsedMonth >= 1 && parsedMonth <= 12 ? parsedMonth - 1 : 9;
-        return {
-          year: Number(pub.year) || 2026,
-          month: monthIdx,
-          half: Number(pub.periodIndex) === 1 ? 0 : 1,
-          pubTitle: pub.title || 'Democratic Competitiveness Map',
-          label: pub.reportingPeriodLabel || pub.title,
-          short: pub.reportingPeriodLabel || pub.title,
-          cutoff: pub.evidenceCutoffDate || '',
-          method: pub.methodologyVersion || 'v1.1',
-          revisions: pub.revisionNote || 'none',
-          summary: pub.summary || '',
-          changesSummary: pub.changesSummary || '',
-          cls: clsMap,
-          details: detailsMap
-        };
-      });
-    }
-    return DCM_PUBS;
+  const isStandaloneUrlMode = !isEmbedded && !hideAside;
+
+  // Single canonical source of strictly published DCM editions (daily + legacy) sorted chronologically ascending
+  const publishedCanonical: DcmPublication[] = useMemo(() => {
+    return resolvePublicDcmPublications(dcmPublications, INITIAL_DCM_PUBLICATIONS);
   }, [dcmPublications]);
 
-  const latestPubIndex = Math.max(0, allPubs.length - 1);
+  // Project each canonical publication through buildCanonicalPublicationView so map, cards, search, legend,
+  // metadata, and trend cells all share the exact same approved publication snapshot.
+  const allPubs: DcmPubItem[] = useMemo(() => {
+    return publishedCanonical.map((pub) => {
+      const view = buildCanonicalPublicationView(pub);
+      const clsMap: Record<string, string> = {};
+      const detailsMap: Record<string, DcmStateDetail> = {};
 
-  // Publication index state (defaults to latest) and tracks whether user manually picked an archive period
-  const [pi, setPi] = useState<number>(() => latestPubIndex);
-  const [hasManualSelection, setHasManualSelection] = useState<boolean>(false);
+      for (const st of view.stateList) {
+        clsMap[st.mapName] = st.code;
+        detailsMap[st.mapName] = {
+          keyFinding: st.hasApprovedFinding ? st.keyFinding : '',
+          confidence: st.hasApprovedConfidence ? st.confidenceLabel : '',
+          direction: st.hasApprovedDirection ? st.rawDirection : '',
+          rightOfResponse: st.rightOfResponseLabel !== 'Not specified' ? st.rightOfResponseLabel : '',
+          carriedForward: st.carriedForward,
+          lastSubstantiveReviewDate: st.lastSubstantiveReviewDate
+        };
+      }
 
-  // Always update to the newest DCM map on homepage (hideAside) or before manual archive selection
-  React.useEffect(() => {
-    if (hideAside || !hasManualSelection || pi >= allPubs.length) {
-      setPi(latestPubIndex);
+      return {
+        id: pub.id,
+        year: view.meta.year,
+        month: view.meta.month - 1,
+        half: view.meta.periodIndex === 1 ? 0 : 1,
+        publicationFormat: view.meta.isDaily ? 'daily' : 'legacy-period',
+        assessmentDate: pub.assessmentDate,
+        evidenceCutoffTimeWat: pub.evidenceCutoffTimeWat,
+        evidenceCutoffDateTimeWat: pub.evidenceCutoffDateTimeWat,
+        publishedAt: pub.publishedAt,
+        isQuietDay: view.meta.isQuietDay,
+        carriedForwardAllStates: Boolean(pub.carriedForwardAllStates),
+        pubTitle: view.meta.title,
+        label: view.meta.periodLabel,
+        short: view.meta.periodLabel,
+        cutoff: view.meta.evidenceCutoffLabel,
+        method: view.meta.methodologyVersion,
+        revisions: view.meta.revisionNote || 'none',
+        summary: pub.summary || '',
+        changesSummary: pub.changesSummary || '',
+        cls: clsMap,
+        details: detailsMap,
+        canonicalView: view,
+        rawPublication: pub
+      };
+    });
+  }, [publishedCanonical]);
+
+  // Initial URL permalink resolution (standalone DCM page only)
+  const initialUrlResolution = useMemo(() => {
+    if (!isStandaloneUrlMode || typeof window === 'undefined') return null;
+    return resolveDcmPermalink(publishedCanonical, window.location.search, {
+      allowOnDemandFetchForUnknownId: true
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Stable publication ID selection (never silently jumps a manually chosen or URL-pinned historical edition to latest)
+  const [selectedPubId, setSelectedPubId] = useState<string | null>(() => {
+    if (initialUrlResolution?.requiresOnDemandFetchId) {
+      return initialUrlResolution.requiresOnDemandFetchId;
     }
-  }, [hideAside, hasManualSelection, latestPubIndex, allPubs.length, pi]);
+    if (initialUrlResolution?.isPermalinkLocked && initialUrlResolution.activePublication) {
+      return initialUrlResolution.activePublication.id;
+    }
+    const latest = publishedCanonical[publishedCanonical.length - 1];
+    return latest ? latest.id : null;
+  });
+  const [hasManualSelection, setHasManualSelection] = useState<boolean>(() =>
+    Boolean(initialUrlResolution?.isPermalinkLocked)
+  );
+  const [permalinkNotice, setPermalinkNotice] = useState<{
+    message: string;
+    tone: 'warning' | 'info';
+  } | null>(() =>
+    initialUrlResolution?.notice && initialUrlResolution.noticeTone !== 'none'
+      ? { message: initialUrlResolution.notice, tone: initialUrlResolution.noticeTone }
+      : null
+  );
 
-  // Selected state on map/dropdown (defaults to null so no state is clicked by default unless specified in URL)
+  const fetchedDeepIdsRef = useRef<Set<string>>(new Set());
+  const fetchedStateEvidenceRef = useRef<Set<string>>(new Set());
+  const isApplyingPopstateRef = useRef<boolean>(false);
+  const hasHydratedUrlAfterLoadRef = useRef<boolean>(false);
+
+  // Selected state on map/dropdown (normalized across all 36 states + FCT when specified in URL)
   const [sel, setSel] = useState<string | null>(() => {
-    if (typeof window !== 'undefined') {
+    if (initialUrlResolution?.selectedStateName) {
+      return initialUrlResolution.selectedStateName;
+    }
+    if (typeof window !== 'undefined' && !isStandaloneUrlMode) {
       const params = new URLSearchParams(window.location.search);
       const st = params.get('state');
-      if (st) return st;
+      if (st) return resolveJurisdictionMeta(st)?.name || null;
     }
     return null;
   });
-  // Hovered state for interactive Flourish tooltip card
+
+  // On-demand fetch for deep historical permalinks not in the initial bounded 60-edition window
+  useEffect(() => {
+    if (!isStandaloneUrlMode || typeof window === 'undefined') return;
+    const res = resolveDcmPermalink(publishedCanonical, window.location.search, {
+      allowOnDemandFetchForUnknownId: true
+    });
+
+    if (res.requiresOnDemandFetchId && !fetchedDeepIdsRef.current.has(res.requiresOnDemandFetchId)) {
+      const targetId = res.requiresOnDemandFetchId;
+      fetchedDeepIdsRef.current.add(targetId);
+      loadDcmPublicationById(targetId).then((loaded) => {
+        if (loaded) {
+          setHasManualSelection(true);
+          setSelectedPubId(loaded.id);
+          setPermalinkNotice(null);
+        } else {
+          // Record does not exist or is unpublished/draft — reject gracefully
+          const fallbackRes = resolveDcmPermalink(publishedCanonical, window.location.search, {
+            allowOnDemandFetchForUnknownId: false
+          });
+          setHasManualSelection(false);
+          if (fallbackRes.activePublication) {
+            setSelectedPubId(fallbackRes.activePublication.id);
+          }
+          if (fallbackRes.notice && fallbackRes.noticeTone !== 'none') {
+            setPermalinkNotice({ message: fallbackRes.notice, tone: fallbackRes.noticeTone });
+          }
+        }
+      });
+      return;
+    }
+
+    // Re-apply URL once live Firestore data arrives (only if user has not manually navigated away)
+    if (!hasHydratedUrlAfterLoadRef.current && res.parsed.hasAnyDcmParam) {
+      if (res.isPermalinkLocked && res.activePublication) {
+        hasHydratedUrlAfterLoadRef.current = true;
+        setHasManualSelection(true);
+        setSelectedPubId(res.activePublication.id);
+        if (res.selectedStateName) setSel(res.selectedStateName);
+        if (res.notice && res.noticeTone !== 'none') {
+          setPermalinkNotice({ message: res.notice, tone: res.noticeTone });
+        } else {
+          setPermalinkNotice(null);
+        }
+      } else if (res.notice && res.noticeTone !== 'none') {
+        setPermalinkNotice({ message: res.notice, tone: res.noticeTone });
+      }
+    }
+  }, [isStandaloneUrlMode, publishedCanonical, loadDcmPublicationById]);
+
+  // Sync default selection to the latest released edition ONLY on homepage (hideAside) or before manual/permalink lock
+  useEffect(() => {
+    if (publishedCanonical.length === 0) return;
+    const latestId = publishedCanonical[publishedCanonical.length - 1].id;
+    const selectionStillExists = Boolean(selectedPubId && publishedCanonical.some((p) => p.id === selectedPubId));
+    const isPendingOnDemandFetch = Boolean(
+      selectedPubId && fetchedDeepIdsRef.current.has(selectedPubId) && !selectionStillExists
+    );
+    if (hideAside || !hasManualSelection || (!selectionStillExists && !isPendingOnDemandFetch)) {
+      if (selectedPubId !== latestId) {
+        setSelectedPubId(latestId);
+      }
+    }
+  }, [hideAside, hasManualSelection, publishedCanonical, selectedPubId]);
+
+  // Trigger on-demand state-scoped evidence fetch whenever a state is selected
+  useEffect(() => {
+    if (!sel) return;
+    const meta = resolveJurisdictionMeta(sel);
+    if (!meta || fetchedStateEvidenceRef.current.has(meta.code)) return;
+    fetchedStateEvidenceRef.current.add(meta.code);
+    loadDcmStateEvidence(meta.code).catch(() => {});
+  }, [sel, loadDcmStateEvidence]);
+
+  // Synchronise browser address bar without infinite loops or clobbering unrelated query parameters
+  const syncBrowserUrl = useCallback(
+    (pub: DcmPublication | null | undefined, stateName: string | null) => {
+      if (!isStandaloneUrlMode || typeof window === 'undefined' || !pub) return;
+      if (isApplyingPopstateRef.current) return;
+
+      const nextUrl = buildDcmPermalinkUrl({
+        publication: pub,
+        stateName,
+        pathname: window.location.pathname,
+        existingSearch: window.location.search
+      });
+      const currentUrl = `${window.location.pathname}${window.location.search}`;
+      if (nextUrl !== currentUrl) {
+        window.history.pushState({ dcmPubId: pub.id, dcmState: stateName }, '', nextUrl);
+      }
+    },
+    [isStandaloneUrlMode]
+  );
+
+  // Handle browser Back / Forward navigation cleanly
+  useEffect(() => {
+    if (!isStandaloneUrlMode || typeof window === 'undefined') return;
+
+    const handlePopState = () => {
+      isApplyingPopstateRef.current = true;
+      const res = resolveDcmPermalink(publishedCanonical, window.location.search, {
+        allowOnDemandFetchForUnknownId: false
+      });
+      if (res.activePublication) {
+        setSelectedPubId(res.activePublication.id);
+      }
+      setHasManualSelection(res.isPermalinkLocked);
+      setSel(res.selectedStateName);
+      setPermalinkNotice(
+        res.notice && res.noticeTone !== 'none'
+          ? { message: res.notice, tone: res.noticeTone }
+          : null
+      );
+      setTimeout(() => {
+        isApplyingPopstateRef.current = false;
+      }, 0);
+    };
+
+    window.addEventListener('popstate', handlePopState);
+    return () => {
+      window.removeEventListener('popstate', handlePopState);
+    };
+  }, [isStandaloneUrlMode, publishedCanonical]);
+
+  // Hovered state for interactive tooltip card
   const [hoveredState, setHoveredState] = useState<{
     name: string;
     cx: number;
@@ -413,30 +636,72 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
   const [mapSearchQuery, setMapSearchQuery] = useState<string>('');
   // Toggle for state name labels on the map
   const [showMapLabels, setShowMapLabels] = useState<boolean>(true);
-
-  // Automatically scroll to the state info section when a state is clicked or selected
-  const selectState = useCallback((stateName: string | null, shouldScroll = true) => {
-    setHoveredState(null);
-    setSel(stateName);
-    if (stateName && shouldScroll) {
-      setTimeout(() => {
-        if (stateInfoRef.current) {
-          const rect = stateInfoRef.current.getBoundingClientRect();
-          const windowHeight = window.innerHeight || document.documentElement.clientHeight;
-          const isFullyVisible = rect.top >= 20 && rect.bottom <= windowHeight - 20;
-
-          // On mobile / stacked screens, aside is underneath map, so scroll directly to it
-          // On desktop, scroll smoothly if not already fully visible
-          if (!isFullyVisible || window.innerWidth < 1024) {
-            stateInfoRef.current.scrollIntoView({
-              behavior: 'smooth',
-              block: window.innerWidth < 1024 ? 'start' : 'nearest'
-            });
-          }
-        }
-      }, 70);
-    }
+  // Collapsible explanatory sections on mobile (desktop lg+ always displays expanded)
+  const [openExplanatoryMobile, setOpenExplanatoryMobile] = useState<Record<string, boolean>>({});
+  const toggleExplanatoryMobile = useCallback((sectionKey: string) => {
+    setOpenExplanatoryMobile((prev) => ({ ...prev, [sectionKey]: !prev[sectionKey] }));
   }, []);
+
+  // Helper to select a publication by ID and sync shareable URL
+  const selectEditionAndSyncUrl = useCallback(
+    (pubId: string, nextStateOverride?: string | null, shouldScrollToTop = false) => {
+      const targetPub = publishedCanonical.find((p) => p.id === pubId);
+      if (!targetPub) return;
+      const resolvedState = nextStateOverride !== undefined ? nextStateOverride : sel;
+      setHasManualSelection(true);
+      setSelectedPubId(targetPub.id);
+      if (nextStateOverride !== undefined) {
+        setSel(nextStateOverride);
+      }
+      setPermalinkNotice(null);
+      syncBrowserUrl(targetPub, resolvedState);
+      if (shouldScrollToTop && typeof window !== 'undefined') {
+        const mapEl = document.getElementById('dcm-map-section');
+        if (mapEl) {
+          mapEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+      }
+    },
+    [publishedCanonical, sel, syncBrowserUrl]
+  );
+
+  // Automatically scroll to the state info section when a state is clicked or selected, and sync shareable URL
+  const selectState = useCallback(
+    (stateName: string | null, shouldScroll = true) => {
+      setHoveredState(null);
+      const normalizedState = stateName ? resolveJurisdictionMeta(stateName)?.name || stateName : null;
+      setSel(normalizedState);
+      setPermalinkNotice(null);
+
+      const currentPub =
+        publishedCanonical.find((p) => p.id === selectedPubId) ||
+        publishedCanonical[publishedCanonical.length - 1] ||
+        null;
+      if (currentPub) {
+        syncBrowserUrl(currentPub, normalizedState);
+      }
+
+      if (normalizedState && shouldScroll) {
+        setTimeout(() => {
+          if (stateInfoRef.current) {
+            const rect = stateInfoRef.current.getBoundingClientRect();
+            const windowHeight = window.innerHeight || document.documentElement.clientHeight;
+            const isFullyVisible = rect.top >= 20 && rect.bottom <= windowHeight - 20;
+
+            // On mobile / stacked screens, aside is underneath map, so scroll directly to it
+            // On desktop, scroll smoothly if not already fully visible
+            if (!isFullyVisible || window.innerWidth < 1024) {
+              stateInfoRef.current.scrollIntoView({
+                behavior: 'smooth',
+                block: window.innerWidth < 1024 ? 'start' : 'nearest'
+              });
+            }
+          }
+        }, 70);
+      }
+    },
+    [publishedCanonical, selectedPubId, syncBrowserUrl]
+  );
 
   const touchDataRef = useRef<{
     startDist: number;
@@ -664,31 +929,24 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
   const [fConsent, setFConsent] = useState<boolean>(false);
   const [fWebsite, setFWebsite] = useState<string>('');
 
-  const effectivePi = hideAside ? latestPubIndex : pi;
-  const safePi = Math.min(Math.max(0, effectivePi), allPubs.length - 1);
+  const selectionResolution = useMemo(() => {
+    return resolveSelectedPublication(publishedCanonical, selectedPubId, hideAside || !hasManualSelection);
+  }, [publishedCanonical, selectedPubId, hideAside, hasManualSelection]);
+
+  const safePi = Math.max(0, selectionResolution.activeIndex);
   const activePub = allPubs[safePi] || allPubs[allPubs.length - 1];
+  const activeView = activePub?.canonicalView || null;
   const curCls = activePub.cls;
   const prevPub = safePi > 0 ? allPubs[safePi - 1] : null;
   const prevCls = prevPub ? prevPub.cls : null;
 
   const getCatCode = (map: Record<string, string> | null, name: string): string => {
-    return (map && map[name]) || 'X';
+    if (!map) return 'U';
+    const code = map[name];
+    return code && DCM_CAT[code] ? code : 'U';
   };
 
-  // Formatted summary period label and CMS Executive Summary / National Overview paragraphs
-  const summaryPeriod = useMemo(() => {
-    return activePub.label.replace(/\s*\(.*\)$/, '') === 'Baseline'
-      ? 'baseline, 1 July to 13 September 2026'
-      : activePub.short;
-  }, [activePub]);
-
-  const summaryParagraphs = useMemo(() => {
-    const raw = (activePub.summary || activePub.changesSummary || '').trim();
-    if (!raw) return [];
-    return raw.split(/\n+/).map((p) => p.trim()).filter(Boolean);
-  }, [activePub.summary, activePub.changesSummary]);
-
-  // Available dropdown options
+  // Available dropdown options (ordered newest-first for Year, chronological for Month, stable ID for Period)
   const years = useMemo(() => {
     const list: number[] = [];
     allPubs.forEach((p) => {
@@ -708,14 +966,41 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
   }, [allPubs, activePub.year]);
 
   const periodOpts = useMemo(() => {
-    const list: Array<{ value: number; label: string }> = [];
-    allPubs.forEach((p, index) => {
+    const list: Array<{ value: string; label: string }> = [];
+    allPubs.forEach((p) => {
       if (p.year === activePub.year && p.month === activePub.month) {
-        list.push({ value: index, label: p.label });
+        const optionLabel = p.publicationFormat === 'daily'
+          ? `${p.label} (Daily)`
+          : p.label;
+        list.push({ value: p.id, label: optionLabel });
       }
     });
     return list;
   }, [allPubs, activePub.year, activePub.month]);
+
+  // Stage 4: Unified full-width publication selector options (daily + legacy, newest first, stable IDs)
+  const unifiedPubOptions = useMemo(() => {
+    return buildUnifiedPublicationOptions(publishedCanonical);
+  }, [publishedCanonical]);
+
+  // Stage 4: Latest published edition metadata & accurate "What changed today?" / "Latest published update" banner
+  const latestPublishedCanonical = useMemo(() => {
+    return publishedCanonical.length > 0 ? publishedCanonical[publishedCanonical.length - 1] : null;
+  }, [publishedCanonical]);
+
+  const dailyUpdateBanner = useMemo(() => {
+    return resolveDailyUpdateBanner(selectionResolution.activePublication, latestPublishedCanonical);
+  }, [selectionResolution.activePublication, latestPublishedCanonical]);
+
+  const latestPubCutoffSummary = useMemo(() => {
+    const latestItem = allPubs.length > 0 ? allPubs[allPubs.length - 1] : null;
+    if (!latestItem) return null;
+    return {
+      periodLabel: latestItem.short,
+      cutoffLabel: latestItem.cutoff,
+      isDaily: latestItem.publicationFormat === 'daily'
+    };
+  }, [allPubs]);
 
   // State options sorted alphabetically
   const stateOpts = useMemo(() => {
@@ -735,38 +1020,102 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
     return stateOpts.filter((name) => name.toLowerCase().includes(q));
   }, [stateOpts, mapSearchQuery]);
 
-  // Selected state info
-  const selCatCode = sel ? getCatCode(curCls, sel) : 'X';
-  const selCatObj = DCM_CAT[selCatCode] || DCM_CAT.X;
+  // Selected state info (strictly sourced from activePub's canonical view)
+  const selDetails = useMemo(() => {
+    return sel ? getStateDetails(activePub, prevPub, sel) : null;
+  }, [activePub, prevPub, sel]);
+  const selCatObj = selDetails
+    ? { name: selDetails.classification, hex: selDetails.hex }
+    : DCM_CAT.U;
 
-  // Trend grid for selected state (12 months x 2 halves)
+  // Stage 5: Historical correction lineage and permalink helpers for active edition
+  const activeCorrectionChain = useMemo(() => {
+    return resolvePublicationCorrectionChain(publishedCanonical, selectionResolution.activePublication);
+  }, [publishedCanonical, selectionResolution.activePublication]);
+
+  const activeStatePermalink = useMemo(() => {
+    if (!selectionResolution.activePublication || !sel) return '';
+    return buildDcmPermalinkUrl({
+      publication: selectionResolution.activePublication,
+      stateName: sel
+    });
+  }, [selectionResolution.activePublication, sel]);
+
+  const activeAbsoluteStatePermalink = useMemo(() => {
+    if (!selectionResolution.activePublication || !sel) return '';
+    return buildAbsoluteDcmPermalink({
+      publication: selectionResolution.activePublication,
+      stateName: sel
+    });
+  }, [selectionResolution.activePublication, sel]);
+
+  const buildHistoricalPermalinkForSelectedState = useCallback(
+    (pubId: string) => {
+      const found = publishedCanonical.find((p) => p.id === pubId);
+      if (!found) return '/democratic-competitiveness-map';
+      return buildDcmPermalinkUrl({
+        publication: found,
+        stateName: sel
+      });
+    },
+    [publishedCanonical, sel]
+  );
+
+  // Stage 3: Full State Assessment Panel data (Sections A-E) resolved from canonical selected publication
+  const selectedStatePanelData = useMemo(() => {
+    if (!sel || !selectionResolution.activePublication) return null;
+    return resolveStateAssessmentPanelData({
+      selectedPub: selectionResolution.activePublication,
+      previousPub: selectionResolution.previousPublication,
+      allPublishedSortedAsc: publishedCanonical,
+      stateKey: sel,
+      evidenceRecords: dcmEvidence,
+      incidentRecords: dcmIncidents,
+      developmentRecords: dcmIncidentDevelopments
+    });
+  }, [
+    sel,
+    selectionResolution.activePublication,
+    selectionResolution.previousPublication,
+    publishedCanonical,
+    dcmEvidence,
+    dcmIncidents,
+    dcmIncidentDevelopments
+  ]);
+
+  // Trend grid for selected state (12 months x 2 halves; respects stable pubId)
   const monthTrends = useMemo(() => {
     return DCM_MONTHS.map((mName, m) => {
       const halves = [0, 1].map((h) => {
-        let foundIdx = -1;
-        allPubs.forEach((p, index) => {
+        let foundPub: DcmPubItem | null = null;
+        allPubs.forEach((p) => {
           if (p.year === activePub.year && p.month === m && p.half === h) {
-            foundIdx = index;
+            // Prefer the currently selected publication if multiple editions fall in the same half-month
+            if (p.id === activePub.id || !foundPub || foundPub.id !== activePub.id) {
+              foundPub = p;
+            }
           }
         });
         const part = h === 0 ? '1st to 15th' : '16th to month-end';
-        if (foundIdx < 0 || !sel) {
+        if (!foundPub || !sel) {
           return {
             hex: '#f1f2f4',
             disabled: true,
             aria: `${mName} ${activePub.year}, ${part}: no publication`,
             isActive: false,
-            pubIdx: -1
+            pubId: ''
           };
         }
-        const cCode = getCatCode(allPubs[foundIdx].cls, sel);
-        const isActive = foundIdx === safePi;
+        const matched = foundPub as DcmPubItem;
+        const cCode = getCatCode(matched.cls, sel);
+        const catMeta = DCM_CAT[cCode] || DCM_CAT.U;
+        const isActive = matched.id === activePub.id;
         return {
-          hex: DCM_CAT[cCode]?.hex || '#c9cdd2',
+          hex: catMeta.hex,
           disabled: false,
-          aria: `${mName} ${activePub.year}, ${part}: ${DCM_CAT[cCode]?.name || 'Insufficient evidence'}${isActive ? ' (map shown)' : ''}`,
+          aria: `${mName} ${activePub.year}, ${part} (${matched.short}): ${catMeta.name}${isActive ? ' (map shown)' : ''}`,
           isActive,
-          pubIdx: foundIdx
+          pubId: matched.id
         };
       });
       return {
@@ -775,7 +1124,7 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
         halves
       };
     });
-  }, [allPubs, activePub.year, sel, safePi]);
+  }, [allPubs, activePub.year, activePub.id, sel]);
 
   // Validation for form submission
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
@@ -842,13 +1191,12 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
     }
   };
 
-  // Change selector handlers
+  // Change selector handlers (using stable publication IDs and synchronising shareable URL)
   const handleYearChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
     const y = Number(e.target.value);
     for (let i = allPubs.length - 1; i >= 0; i--) {
       if (allPubs[i].year === y) {
-        setHasManualSelection(true);
-        setPi(i);
+        selectEditionAndSyncUrl(allPubs[i].id);
         return;
       }
     }
@@ -858,16 +1206,14 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
     const m = Number(e.target.value);
     for (let i = allPubs.length - 1; i >= 0; i--) {
       if (allPubs[i].year === activePub.year && allPubs[i].month === m) {
-        setHasManualSelection(true);
-        setPi(i);
+        selectEditionAndSyncUrl(allPubs[i].id);
         return;
       }
     }
   };
 
   const handlePeriodChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
-    setHasManualSelection(true);
-    setPi(Number(e.target.value));
+    selectEditionAndSyncUrl(e.target.value);
   };
 
   const handleStateSelect = (e: React.ChangeEvent<HTMLSelectElement>) => {
@@ -879,6 +1225,7 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
   const renderedShapes = useMemo(() => {
     return DCM_GEO.states.map((s) => {
       const c = getCatCode(curCls, s.name);
+      const catMeta = DCM_CAT[c] || DCM_CAT.U;
       const isChanged = Boolean(prevCls && getCatCode(prevCls, s.name) !== c);
       const isSel = s.name === sel;
       const isHovered = !sel && hoveredState?.name === s.name;
@@ -894,111 +1241,118 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
       return {
         ...s,
         cCode: c,
-        fill: DCM_CAT[c]?.hex || '#c9cdd2',
+        fill: catMeta.hex,
         opacity: (!sel || isSel) ? 1 : (isHovered ? 1 : 0.35),
         stroke: isBoldWhite ? '#ffffff' : '#1c232b',
         strokeWidth: isBoldWhite ? 3.8 : 0.95,
         isBoldWhite,
         rank,
-        title: `${s.name}: ${DCM_CAT[c]?.name || 'Insufficient evidence'}`
+        title: `${s.name}: ${catMeta.name}`
       };
     }).sort((a, b) => a.rank - b.rank);
   }, [curCls, prevCls, sel, showChanges, hoveredState]);
 
   return (
     <div
+      className={`overflow-x-hidden ${isEmbedded ? 'bg-transparent min-h-0' : 'bg-[#f3f4f6] min-h-screen'}`}
       style={{
         fontFamily: "'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
-        color: '#1c232b',
-        background: isEmbedded ? 'transparent' : '#f3f4f6',
-        minHeight: isEmbedded ? 'auto' : '100vh'
+        color: '#1c232b'
       }}
     >
-
-      {/* Main Container */}
+      {/* Main Container (Mobile-first padding, zero horizontal overflow down to 320px, full 1320px desktop presence) */}
       <div
-        style={{
-          maxWidth: isEmbedded ? '100%' : '1320px',
-          margin: '0 auto',
-          padding: isEmbedded ? '0 0 16px' : '32px 24px 56px',
-          boxSizing: 'border-box',
-          display: 'flex',
-          flexDirection: 'column',
-          gap: '24px'
-        }}
+        className={`mx-auto box-border flex flex-col gap-4 sm:gap-6 min-w-0 ${
+          isEmbedded ? 'max-w-full pb-4' : 'max-w-[1320px] px-3 sm:px-6 pt-5 sm:pt-8 pb-10 sm:pb-14'
+        }`}
       >
-        {/* Header Block */}
+        {/* 1, 2, 3. Header Block: Title, Short Purpose Statement, Latest Published Review Date & WAT Cut-off */}
         {!isEmbedded ? (
-          <header style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-            <h1
-              style={{
-                margin: 0,
-                fontSize: '34px',
-                lineHeight: 1.15,
-                fontWeight: 700,
-                letterSpacing: '-0.02em',
-                color: '#1c232b'
-              }}
-            >
+          <header className="flex flex-col gap-2 min-w-0">
+            <h1 className="m-0 text-2xl sm:text-[32px] lg:text-[34px] leading-[1.15] font-bold tracking-tight text-[#1c232b] text-balance">
               Democratic Competitiveness Map
             </h1>
-            <p
-              style={{
-                margin: 0,
-                fontSize: '17px',
-                lineHeight: 1.5,
-                color: '#3d4752',
-                maxWidth: '760px'
-              }}
-            >
-              Evidence-based classifications of the practical conditions for political competition in the 36 states and the FCT. Use the panel to view any past map or follow one state through the year.
+            <p className="m-0 text-sm sm:text-base lg:text-[17px] leading-relaxed text-[#3d4752] max-w-[760px]">
+              Evidence-based classifications of the practical conditions for political competition across Nigeria’s 36 states and the FCT.
             </p>
+            {latestPubCutoffSummary && (
+              <div
+                aria-label="Latest published evidence review date and cut-off"
+                className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs sm:text-[13px] text-[#3d4752] pt-0.5 min-w-0"
+              >
+                <span>
+                  <strong className="text-[#1c232b] font-semibold">Latest published review:</strong>{' '}
+                  <span className="tabular-nums">{latestPubCutoffSummary.periodLabel}</span>
+                </span>
+                {latestPubCutoffSummary.cutoffLabel && (
+                  <>
+                    <span aria-hidden="true" className="text-slate-400">·</span>
+                    <span>
+                      <strong className="text-[#1c232b] font-semibold">Evidence cut-off:</strong>{' '}
+                      <span className="tabular-nums">{latestPubCutoffSummary.cutoffLabel}</span>
+                    </span>
+                  </>
+                )}
+              </div>
+            )}
+            {/* Stage 5: Transparent notice when a direct URL requests an invalid/unpublished edition, unknown state, or missing date */}
+            {permalinkNotice && (
+              <div
+                role="alert"
+                className={`mt-1 rounded-md border px-3.5 py-2.5 text-xs sm:text-sm flex items-start justify-between gap-3 min-w-0 ${
+                  permalinkNotice.tone === 'warning'
+                    ? 'bg-amber-50 border-amber-300 text-amber-950'
+                    : 'bg-blue-50 border-blue-200 text-slate-900'
+                }`}
+              >
+                <div className="flex items-start gap-2 min-w-0">
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-amber-800" aria-hidden="true" />
+                  <span className="break-words leading-relaxed">{permalinkNotice.message}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setPermalinkNotice(null)}
+                  aria-label="Dismiss notice"
+                  className="shrink-0 bg-transparent border-0 text-xs font-semibold text-slate-600 hover:text-slate-900 cursor-pointer px-1"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
+            {/* Stage 7: Accurate error & retry notice if a bounded Firestore chronological index or query fails (never silently incomplete) */}
+            {dcmArchiveError && (
+              <div
+                role="alert"
+                className="mt-1 rounded-md border border-red-300 bg-red-50 px-3.5 py-2.5 text-xs sm:text-sm text-red-950 flex flex-col sm:flex-row sm:items-center justify-between gap-3 min-w-0"
+              >
+                <div className="flex items-start gap-2 min-w-0">
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-red-700" aria-hidden="true" />
+                  <span className="break-words leading-relaxed">
+                    {dcmArchiveError.message}
+                  </span>
+                </div>
+                {dcmArchiveError.canRetry && (
+                  <button
+                    type="button"
+                    onClick={retryDcmArchiveQueries}
+                    className="shrink-0 min-h-[44px] px-3.5 py-2 rounded-md bg-white border border-red-300 text-xs font-semibold text-red-900 hover:bg-red-100 cursor-pointer"
+                  >
+                    Retry loading archive
+                  </button>
+                )}
+              </div>
+            )}
           </header>
         ) : (
-          <div
-            style={{
-              display: 'flex',
-              alignItems: 'flex-start',
-              justifyContent: 'space-between',
-              flexWrap: 'wrap',
-              gap: '16px',
-              paddingBottom: '4px'
-            }}
-          >
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-              <span
-                style={{
-                  fontSize: '11px',
-                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
-                  fontWeight: 700,
-                  letterSpacing: '0.08em',
-                  color: '#1f5fa8',
-                  textTransform: 'uppercase'
-                }}
-              >
+          <div className="flex items-start justify-between flex-wrap gap-4 pb-1 min-w-0">
+            <div className="flex flex-col gap-1 min-w-0">
+              <span className="text-[11px] font-mono font-bold tracking-wider text-[#1f5fa8] uppercase">
                 Interactive Map Visualization
               </span>
-              <h2
-                style={{
-                  margin: 0,
-                  fontSize: '28px',
-                  fontWeight: 700,
-                  color: '#1c232b',
-                  letterSpacing: '-0.02em',
-                  lineHeight: 1.2
-                }}
-              >
+              <h2 className="m-0 text-2xl sm:text-[28px] font-bold text-[#1c232b] tracking-tight leading-tight">
                 Democratic Competitiveness Map (DCM)
               </h2>
-              <p
-                style={{
-                  margin: '4px 0 0',
-                  fontSize: '15px',
-                  color: '#475569',
-                  maxWidth: '840px',
-                  lineHeight: 1.55
-                }}
-              >
+              <p className="mt-1 mb-0 text-sm sm:text-[15px] text-slate-600 max-w-[840px] leading-relaxed">
                 Nigeria’s political competition environment remains uneven, with concerns concentrated around political mobilisation, campaign access and institutional neutrality as the 2027 elections approach.
               </p>
             </div>
@@ -1011,155 +1365,99 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
                   window.dispatchEvent(new PopStateEvent('popstate'));
                   window.scrollTo(0, 0);
                 }}
-                style={{
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: '8px',
-                  padding: '10px 18px',
-                  background: '#1f5fa8',
-                  color: '#ffffff',
-                  borderRadius: '8px',
-                  fontSize: '13px',
-                  fontWeight: 700,
-                  textDecoration: 'none',
-                  boxShadow: '0 1px 3px rgba(0, 0, 0, 0.1)',
-                  cursor: 'pointer',
-                  transition: 'background 0.15s ease'
-                }}
-                onMouseEnter={(e) => { e.currentTarget.style.background = '#174880'; }}
-                onMouseLeave={(e) => { e.currentTarget.style.background = '#1f5fa8'; }}
+                className="inline-flex items-center gap-2 min-h-[44px] px-4 py-2.5 bg-[#1f5fa8] hover:bg-[#174880] text-white rounded-lg text-[13px] font-bold no-underline shadow-xs transition-colors whitespace-nowrap"
               >
                 <span>View Full DCM Page</span>
-                <span style={{ fontSize: '14px' }}>→</span>
+                <span aria-hidden="true">→</span>
               </a>
             </div>
           </div>
         )}
 
-        {/* Publication Summary / What Changed Card (from CMS Executive Summary / National Overview) */}
-        {!isEmbedded && summaryParagraphs.length > 0 && (
-          <section
-            aria-label="What changed in this publication"
-            style={{
-              background: '#ffffff',
-              border: '1px solid #d5d9de',
-              borderRadius: '6px',
-              padding: '20px 24px',
-              display: 'flex',
-              flexDirection: 'column',
-              gap: '10px'
-            }}
-          >
-            <h2
-              style={{
-                margin: 0,
-                fontSize: '18px',
-                fontWeight: 700,
-                color: '#1c232b',
-                lineHeight: 1.3
-              }}
+        {/* Main Responsive Grid: Single column on mobile/tablet (<1024px) with Map first, Two columns on desktop (1024px+) */}
+        <div
+          className={`grid grid-cols-1 gap-4 sm:gap-6 items-start min-w-0 ${
+            hideAside ? '' : 'lg:grid-cols-[minmax(0,1fr)_400px] xl:grid-cols-[minmax(0,1fr)_420px]'
+          }`}
+        >
+          {/* PRIMARY / LEFT COLUMN: Interactive Map + Instruction + What Changed Today / Latest Update */}
+          <div className="flex flex-col gap-4 sm:gap-6 min-w-0">
+            {/* 4. Interactive Nigeria DCM Map Card */}
+            <section
+              id="dcm-map-section"
+              aria-label="Map"
+              className="bg-white border border-[#d5d9de] rounded-md p-3.5 sm:p-5 flex flex-col gap-3 sm:gap-3.5 min-w-0"
             >
-              What changed in this publication ({summaryPeriod})
-            </h2>
-            {summaryParagraphs.map((paragraph, idx) => (
-              <p
-                key={idx}
-                style={{
-                  margin: 0,
-                  fontSize: '15px',
-                  lineHeight: 1.55,
-                  color: '#3d4752'
-                }}
-              >
-                {paragraph}
-              </p>
-            ))}
-          </section>
-        )}
+              <div className="flex justify-between items-start sm:items-center flex-wrap gap-2 min-w-0">
+                <div className="flex flex-col gap-0.5 min-w-0">
+                  <h2 className="m-0 text-lg sm:text-xl font-bold text-[#1c232b] leading-snug break-words">
+                    Map as published for {activePub.short}
+                  </h2>
+                  {activePub.cutoff && (
+                    <span className="text-xs text-slate-600 tabular-nums break-words">
+                      Evidence cut-off: {activePub.cutoff}
+                    </span>
+                  )}
+                </div>
+                {sel && (
+                  <button
+                    type="button"
+                    onClick={() => selectState(null, false)}
+                    className="min-h-[40px] px-3 py-1.5 text-[13px] font-semibold border border-[#8a939c] rounded bg-white hover:bg-slate-50 text-[#1f5fa8] cursor-pointer whitespace-nowrap focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#1f5fa8]"
+                  >
+                    Reset / All states
+                  </button>
+                )}
+              </div>
 
-        {/* Two Column Layout: Map Section + Aside Controls */}
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '24px', alignItems: 'flex-start' }}>
-
-          {/* LEFT: Map Section */}
-          <section
-            aria-label="Map"
-            style={{
-              flex: '999 1 600px',
-              minWidth: 0,
-              background: '#ffffff',
-              border: '1px solid #d5d9de',
-              borderRadius: '6px',
-              padding: '20px',
-              display: 'flex',
-              flexDirection: 'column',
-              gap: '14px'
-            }}
-          >
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
-              <h2 style={{ margin: 0, fontSize: '20px', fontWeight: 700 }}>
-                Map as published for {activePub.short}
-              </h2>
-              {sel && (
-                <button
-                  type="button"
-                  onClick={() => selectState(null, false)}
-                  style={{
-                    font: 'inherit',
-                    fontSize: '13px',
-                    fontWeight: 600,
-                    padding: '4px 10px',
-                    border: '1px solid #8a939c',
-                    borderRadius: '4px',
-                    background: '#ffffff',
-                    color: '#1f5fa8',
-                    cursor: 'pointer'
-                  }}
+              {/* Compact Classification Legend (Clean responsive grid on 320px+, flex wrap on wider screens) */}
+              <div className="space-y-2 min-w-0">
+                <div
+                  aria-label="Classification colour legend"
+                  className="grid grid-cols-2 sm:flex sm:flex-wrap gap-x-4 gap-y-2 items-center"
                 >
-                  Reset / All states
-                </button>
-              )}
-            </div>
+                  {DCM_ORDER.map((k) => {
+                    const item = DCM_CAT[k];
+                    return (
+                      <span key={k} className="flex items-center gap-2 text-xs sm:text-sm text-[#1c232b] min-w-0">
+                        <span
+                          aria-hidden="true"
+                          className="w-4 h-4 sm:w-[18px] sm:h-[18px] rounded-[3px] border border-[#8a939c] shrink-0 inline-block"
+                          style={{ background: item.hex }}
+                        />
+                        <span className="break-words leading-tight">{item.name}</span>
+                      </span>
+                    );
+                  })}
+                  {activeView && activeView.unavailableCount > 0 && (
+                    <span className="flex items-center gap-2 text-xs sm:text-sm text-slate-600 min-w-0">
+                      <span
+                        aria-hidden="true"
+                        className="w-4 h-4 sm:w-[18px] sm:h-[18px] rounded-[3px] border border-dashed border-slate-400 shrink-0 inline-block"
+                        style={{ background: DCM_CAT.U.hex }}
+                      />
+                      <span className="break-words leading-tight">{DCM_CAT.U.name}</span>
+                    </span>
+                  )}
+                </div>
 
-            {/* Classification Legend */}
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px 22px', alignItems: 'center' }}>
-              {DCM_ORDER.map((k) => {
-                const item = DCM_CAT[k];
-                return (
-                  <span key={k} style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '14px' }}>
-                    <span
-                      aria-hidden="true"
-                      style={{
-                        width: '18px',
-                        height: '18px',
-                        borderRadius: '3px',
-                        border: '1px solid #8a939c',
-                        background: item.hex,
-                        flex: 'none',
-                        display: 'inline-block'
-                      }}
-                    />
-                    {item.name}
-                  </span>
-                );
-              })}
-            </div>
+                <p className="m-0 text-xs sm:text-sm text-[#3d4752] leading-snug">
+                  {INSUFFICIENT_EVIDENCE_DISCLAIMER}
+                </p>
+              </div>
 
-            <p style={{ margin: 0, fontSize: '14px', color: '#3d4752' }}>
-              Insufficient evidence means AEO does not yet hold enough verified evidence to classify the state. It does not mean conditions are open.
-            </p>
-
-            {/* Interactive SVG Nigeria Map with Two-Finger Mobile Zoom and Desktop Zoom */}
-            <div
-              ref={mapContainerRef}
-              style={{
-                position: 'relative',
-                width: '100%',
-                overflow: 'hidden',
-                borderRadius: '6px',
-                background: '#eceef1',
-                touchAction: 'pan-y',
-                userSelect: 'none'
-              }}
+              {/* Interactive SVG Nigeria Map with Two-Finger Mobile Zoom and Desktop Zoom */}
+              <div
+                ref={mapContainerRef}
+                style={{
+                  position: 'relative',
+                  width: '100%',
+                  overflow: 'hidden',
+                  borderRadius: '6px',
+                  background: '#eceef1',
+                  touchAction: 'pan-y',
+                  userSelect: 'none'
+                }}
               onMouseDown={(e) => {
                 if (zoom > 1) {
                   mouseDragRef.current = {
@@ -1247,24 +1545,11 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
                   onClick={handleZoomIn}
                   title="Zoom in (or two-finger pinch on mobile, mouse wheel on desktop)"
                   aria-label="Zoom in"
+                  className="w-10 h-10 sm:w-8 sm:h-8 flex items-center justify-center border-0 bg-transparent text-[19px] font-bold text-[#1c232b] rounded hover:bg-[#f3f4f6] transition-colors"
                   style={{
-                    width: '32px',
-                    height: '32px',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    border: 'none',
-                    background: 'transparent',
                     cursor: zoom >= 4.5 ? 'not-allowed' : 'pointer',
-                    opacity: zoom >= 4.5 ? 0.35 : 1,
-                    fontSize: '19px',
-                    fontWeight: 700,
-                    color: '#1c232b',
-                    borderRadius: '4px',
-                    transition: 'background 0.15s ease'
+                    opacity: zoom >= 4.5 ? 0.35 : 1
                   }}
-                  onMouseEnter={(e) => { e.currentTarget.style.background = '#f3f4f6'; }}
-                  onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
                 >
                   +
                 </button>
@@ -1273,24 +1558,11 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
                   onClick={handleZoomOut}
                   title="Zoom out"
                   aria-label="Zoom out"
+                  className="w-10 h-10 sm:w-8 sm:h-8 flex items-center justify-center border-0 bg-transparent text-[20px] font-bold text-[#1c232b] rounded hover:bg-[#f3f4f6] transition-colors"
                   style={{
-                    width: '32px',
-                    height: '32px',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    border: 'none',
-                    background: 'transparent',
                     cursor: zoom <= 1 ? 'not-allowed' : 'pointer',
-                    opacity: zoom <= 1 ? 0.35 : 1,
-                    fontSize: '20px',
-                    fontWeight: 700,
-                    color: '#1c232b',
-                    borderRadius: '4px',
-                    transition: 'background 0.15s ease'
+                    opacity: zoom <= 1 ? 0.35 : 1
                   }}
-                  onMouseEnter={(e) => { e.currentTarget.style.background = '#f3f4f6'; }}
-                  onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
                 >
                   –
                 </button>
@@ -1300,23 +1572,7 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
                     onClick={handleResetZoom}
                     title="Reset map zoom"
                     aria-label="Reset map zoom"
-                    style={{
-                      width: '32px',
-                      height: '32px',
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      border: 'none',
-                      background: '#eff6ff',
-                      cursor: 'pointer',
-                      fontSize: '13px',
-                      fontWeight: 700,
-                      color: '#1f5fa8',
-                      borderRadius: '4px',
-                      transition: 'background 0.15s ease'
-                    }}
-                    onMouseEnter={(e) => { e.currentTarget.style.background = '#dbeafe'; }}
-                    onMouseLeave={(e) => { e.currentTarget.style.background = '#eff6ff'; }}
+                    className="w-10 h-10 sm:w-8 sm:h-8 flex items-center justify-center border-0 bg-[#eff6ff] hover:bg-[#dbeafe] text-[13px] font-bold text-[#1f5fa8] rounded cursor-pointer transition-colors"
                   >
                     ↺
                   </button>
@@ -1326,29 +1582,17 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
                   onClick={() => setShowMapLabels((prev) => !prev)}
                   title={showMapLabels ? 'Hide state names on map' : 'Show state names on map'}
                   aria-label={showMapLabels ? 'Hide state names on map' : 'Show state names on map'}
-                  style={{
-                    width: '32px',
-                    height: '32px',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    border: 'none',
-                    background: showMapLabels ? '#eff6ff' : 'transparent',
-                    cursor: 'pointer',
-                    fontSize: '11px',
-                    fontWeight: 800,
-                    color: showMapLabels ? '#1d4ed8' : '#64748b',
-                    borderRadius: '4px',
-                    transition: 'background 0.15s ease'
-                  }}
-                  onMouseEnter={(e) => { if (!showMapLabels) e.currentTarget.style.background = '#f3f4f6'; }}
-                  onMouseLeave={(e) => { if (!showMapLabels) e.currentTarget.style.background = 'transparent'; }}
+                  className={`w-10 h-10 sm:w-8 sm:h-8 flex items-center justify-center border-0 text-[11px] font-extrabold rounded cursor-pointer transition-colors ${
+                    showMapLabels
+                      ? 'bg-[#eff6ff] text-[#1d4ed8]'
+                      : 'bg-transparent text-[#64748b] hover:bg-[#f3f4f6]'
+                  }`}
                 >
                   Aa
                 </button>
               </div>
 
-              {/* Floating Map Search Button / Popover (Matching screenshot [🔍] icon) */}
+              {/* Floating Map Search Button / Popover */}
               <div
                 style={{
                   position: 'absolute',
@@ -1363,23 +1607,7 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
                     onClick={() => setMapSearchOpen(true)}
                     title="Search states on map"
                     aria-label="Search states on map"
-                    style={{
-                      width: '32px',
-                      height: '32px',
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      background: 'rgba(255, 255, 255, 0.95)',
-                      backdropFilter: 'blur(4px)',
-                      border: '1px solid #d5d9de',
-                      borderRadius: '6px',
-                      boxShadow: '0 2px 8px rgba(0, 0, 0, 0.1)',
-                      cursor: 'pointer',
-                      color: '#1c232b',
-                      transition: 'background 0.15s ease'
-                    }}
-                    onMouseEnter={(e) => { e.currentTarget.style.background = '#f3f4f6'; }}
-                    onMouseLeave={(e) => { e.currentTarget.style.background = 'rgba(255, 255, 255, 0.95)'; }}
+                    className="w-10 h-10 sm:w-8 sm:h-8 flex items-center justify-center bg-white/95 hover:bg-[#f3f4f6] backdrop-blur-sm border border-[#d5d9de] rounded-md shadow-sm cursor-pointer text-[#1c232b] transition-colors"
                   >
                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
                       <circle cx="11" cy="11" r="8" />
@@ -1395,13 +1623,12 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
                       border: '1px solid #d5d9de',
                       borderRadius: '6px',
                       boxShadow: '0 4px 16px rgba(0, 0, 0, 0.16)',
-                      width: '260px',
-                      maxWidth: 'calc(100vw - 48px)',
+                      width: 'min(240px, calc(100vw - 96px))',
                       overflow: 'hidden'
                     }}
                   >
                     <div style={{ display: 'flex', alignItems: 'center', padding: '6px 10px', gap: '6px' }}>
-                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#64748b" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#64748b" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" className="shrink-0">
                         <circle cx="11" cy="11" r="8" />
                         <line x1="21" y1="21" x2="16.65" y2="16.65" />
                       </svg>
@@ -1411,22 +1638,25 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
                         value={mapSearchQuery}
                         onChange={(e) => setMapSearchQuery(e.target.value)}
                         placeholder="Search state..."
+                        aria-label="Search state on map"
                         style={{
                           flex: 1,
+                          minWidth: 0,
                           border: 'none',
                           outline: 'none',
-                          fontSize: '13px',
+                          fontSize: '14px',
                           color: '#1c232b',
                           background: 'transparent'
                         }}
                       />
                       <button
                         type="button"
+                        aria-label="Close map search"
                         onClick={() => {
                           setMapSearchOpen(false);
                           setMapSearchQuery('');
                         }}
-                        style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#64748b', fontSize: '13px', padding: '0 4px' }}
+                        className="min-w-[28px] min-h-[28px] flex items-center justify-center bg-transparent border-0 cursor-pointer text-[#64748b] text-[13px]"
                       >
                         ✕
                       </button>
@@ -1436,6 +1666,7 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
                         {mapFilteredStates.length > 0 ? (
                           mapFilteredStates.map((st) => {
                             const c = getCatCode(curCls, st);
+                            const catMeta = DCM_CAT[c] || DCM_CAT.U;
                             return (
                               <button
                                 key={st}
@@ -1450,7 +1681,8 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
                                   display: 'flex',
                                   alignItems: 'center',
                                   justifyContent: 'space-between',
-                                  padding: '8px 12px',
+                                  gap: '6px',
+                                  padding: '10px 12px',
                                   border: 'none',
                                   borderBottom: '1px solid #f8fafc',
                                   background: sel === st ? '#eff6ff' : 'transparent',
@@ -1459,10 +1691,10 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
                                   fontSize: '13px'
                                 }}
                               >
-                                <span style={{ fontWeight: 600, color: '#1c232b' }}>{st}</span>
-                                <span style={{ display: 'flex', alignItems: 'center', gap: '5px', fontSize: '11px', color: '#64748b' }}>
-                                  <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: DCM_CAT[c]?.hex || '#c9cdd2' }} />
-                                  {DCM_CAT[c]?.name}
+                                <span style={{ fontWeight: 600, color: '#1c232b' }} className="truncate">{st}</span>
+                                <span style={{ display: 'flex', alignItems: 'center', gap: '5px', fontSize: '11px', color: '#64748b' }} className="shrink-0">
+                                  <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: catMeta.hex }} />
+                                  {catMeta.name}
                                 </span>
                               </button>
                             );
@@ -1481,15 +1713,16 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
               {/* Active Zoom Badge */}
               {zoom > 1 && (
                 <div
+                  className={mapSearchOpen ? 'hidden sm:block' : ''}
                   style={{
                     position: 'absolute',
                     top: '12px',
-                    left: mapSearchOpen ? '282px' : '52px',
+                    left: mapSearchOpen ? '262px' : '60px',
                     zIndex: 40,
                     background: 'rgba(255, 255, 255, 0.92)',
                     backdropFilter: 'blur(4px)',
                     border: '1px solid #d5d9de',
-                    padding: '3px 8px',
+                    padding: '4px 8px',
                     borderRadius: '4px',
                     fontSize: '11px',
                     fontWeight: 600,
@@ -1631,7 +1864,7 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
                 if (!activeTooltipState) return null;
 
                 const details = getStateDetails(activePub, prevPub, activeTooltipState.name);
-                const cutoffText = activePub.cutoff || '28 September 2026';
+                const cutoffText = activePub.cutoff || 'Not recorded';
 
                 const containerW = mapContainerRef.current?.clientWidth || 760;
                 const containerH = mapContainerRef.current?.clientHeight || 617;
@@ -1640,11 +1873,11 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
                 const visualX = containerW / 2 + (u * containerW - containerW / 2) * zoom + pan.x;
                 const visualY = containerH / 2 + (v * containerH - containerH / 2) * zoom + pan.y;
 
+                const cardW = Math.min(296, Math.max(220, containerW - 16));
                 const isRightSide = visualX > containerW * 0.52;
-                const tooltipLeft = isRightSide
-                  ? Math.max(12, visualX - 315)
-                  : Math.min(containerW - 315, visualX + 15);
-                const tooltipTop = Math.max(12, Math.min(containerH - 250, visualY - 60));
+                const rawLeft = isRightSide ? visualX - cardW - 12 : visualX + 12;
+                const tooltipLeft = Math.max(8, Math.min(containerW - cardW - 8, rawLeft));
+                const tooltipTop = Math.max(8, Math.min(Math.max(8, containerH - 220), visualY - 50));
 
                 return (
                   <div
@@ -1655,12 +1888,12 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
                       pointerEvents: isPinned ? 'auto' : 'none',
                       background: '#ffffff',
                       color: '#1c232b',
-                      padding: '18px 20px',
+                      padding: '16px 18px',
                       borderRadius: '6px',
                       boxShadow: '0 10px 25px -5px rgba(0, 0, 0, 0.16), 0 8px 10px -6px rgba(0, 0, 0, 0.08)',
                       border: '1px solid #d5d9de',
-                      width: '300px',
-                      maxWidth: 'calc(100% - 24px)',
+                      width: `${cardW}px`,
+                      maxWidth: 'calc(100% - 16px)',
                       zIndex: 60,
                       fontFamily: "'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
                     }}
@@ -1692,8 +1925,19 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
                     </div>
 
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', fontSize: '13px', lineHeight: 1.45 }}>
-                      <div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
                         <strong style={{ color: '#1e293b' }}>DCM Classification: </strong>
+                        <span
+                          aria-hidden="true"
+                          style={{
+                            width: '10px',
+                            height: '10px',
+                            borderRadius: '2px',
+                            background: details.hex,
+                            border: '1px solid #8a939c',
+                            display: 'inline-block'
+                          }}
+                        />
                         <span style={{ color: '#334155' }}>{details.classification}</span>
                       </div>
 
@@ -1709,62 +1953,286 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
 
                       <div>
                         <strong style={{ color: '#1e293b' }}>Key Finding: </strong>
-                        <span style={{ color: '#334155' }}>{details.keyFinding}</span>
+                        <span style={{ color: details.hasApprovedFinding ? '#334155' : '#64748b', fontStyle: details.hasApprovedFinding ? 'normal' : 'italic' }}>
+                          {details.keyFinding}
+                        </span>
                       </div>
+
+                      {details.carriedForward && (
+                        <div style={{ fontSize: '12px', color: '#475569' }}>
+                          <strong style={{ color: '#1e293b' }}>Assessment Status: </strong>
+                          <span>Carried forward from prior approved assessment</span>
+                        </div>
+                      )}
+
+                      {details.lastSubstantiveReviewDate && (
+                        <div style={{ fontSize: '12px', color: '#475569' }}>
+                          <strong style={{ color: '#1e293b' }}>Last Substantive Review: </strong>
+                          <span>{formatDailyDateLabel(details.lastSubstantiveReviewDate)}</span>
+                        </div>
+                      )}
                     </div>
 
                     <div style={{ marginTop: '14px', paddingTop: '10px', borderTop: '1px solid #f1f5f9', fontSize: '11px', color: '#64748b', lineHeight: 1.4 }}>
                       <div>AEO Democratic Competitiveness Map (DCM)</div>
-                      <div>Updated: {cutoffText}</div>
+                      <div>{activePub.publicationFormat === 'daily' ? `Evidence cut-off: ${cutoffText}` : `Updated: ${cutoffText}`}</div>
                     </div>
                   </div>
                 );
               })()}
             </div>
-          </section>
 
-          {/* RIGHT: Aside Controls & State Trend */}
+              {/* 5. Map Selection Instruction & Visible Selected-State Feedback Bar */}
+              <div className="flex flex-col gap-2.5 pt-1 min-w-0">
+                <p className="m-0 text-sm font-medium text-[#1c232b] leading-snug">
+                  {MAP_SELECTION_INSTRUCTION}
+                </p>
+
+                {sel && !hideAside && (
+                  <div
+                    role="status"
+                    aria-live="polite"
+                    className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 bg-slate-50 border border-slate-200 rounded-md p-3 min-w-0"
+                  >
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <span
+                        aria-hidden="true"
+                        className="w-4 h-4 rounded-[3px] border border-[#8a939c] shrink-0 inline-block"
+                        style={{ backgroundColor: selCatObj.hex }}
+                      />
+                      <div className="text-xs sm:text-sm min-w-0 break-words">
+                        <strong className="text-[#1c232b]">{sel}</strong>
+                        <span aria-hidden="true" className="text-slate-400"> · </span>
+                        <span className="text-[#3d4752] font-medium">{selCatObj.name}</span>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          stateInfoRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                        }}
+                        className="flex-1 sm:flex-none min-h-[44px] sm:min-h-[36px] px-3 py-2 sm:py-1.5 rounded bg-[#1f5fa8] hover:bg-[#174880] text-white text-xs font-semibold cursor-pointer whitespace-nowrap focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#1f5fa8]"
+                      >
+                        Inspect evidence ↓
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => selectState(null, false)}
+                        className="min-h-[44px] sm:min-h-[36px] px-3 py-2 sm:py-1.5 rounded border border-slate-300 bg-white hover:bg-slate-100 text-xs font-semibold text-slate-700 cursor-pointer whitespace-nowrap focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#1f5fa8]"
+                      >
+                        Clear
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </section>
+
+            {/* 6. "What changed today?" / "Latest published update" Section Immediately Below the Map */}
+            {!isEmbedded && (
+              <section
+                id="dcm-daily-update"
+                aria-label={dailyUpdateBanner.heading}
+                className="bg-white border border-[#d5d9de] rounded-md p-4 sm:p-5 flex flex-col gap-2.5 min-w-0"
+              >
+                <div className="flex flex-col gap-1 min-w-0">
+                  <h2 className="m-0 text-lg font-bold text-[#1c232b] leading-snug break-words">
+                    {dailyUpdateBanner.heading}
+                  </h2>
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-[#3d4752] tabular-nums">
+                    <span className="font-semibold text-[#1c232b]">{dailyUpdateBanner.dateLabel}</span>
+                    {dailyUpdateBanner.evidenceCutoffLabel && (
+                      <>
+                        <span aria-hidden="true" className="text-slate-400">·</span>
+                        <span>Evidence cut-off: {dailyUpdateBanner.evidenceCutoffLabel}</span>
+                      </>
+                    )}
+                    {dailyUpdateBanner.isQuietDay && (
+                      <>
+                        <span aria-hidden="true" className="text-slate-400">·</span>
+                        <span>Quiet-day update</span>
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                {dailyUpdateBanner.hasApprovedSummary ? (
+                  <div className="space-y-2.5">
+                    {dailyUpdateBanner.summaryParagraphs.map((paragraph, idx) => (
+                      <p
+                        key={idx}
+                        className="m-0 text-sm sm:text-[15px] leading-relaxed text-[#3d4752] break-words"
+                      >
+                        {paragraph}
+                      </p>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="m-0 text-sm italic text-slate-600 leading-relaxed">
+                    {dailyUpdateBanner.unavailableMessage}
+                  </p>
+                )}
+
+                {dailyUpdateBanner.completeRecordUrl && (
+                  <div className="pt-1">
+                    <a
+                      href={dailyUpdateBanner.completeRecordUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1.5 min-h-[40px] text-sm font-semibold text-[#1f5fa8] hover:underline break-words"
+                    >
+                      <span>View complete published record</span>
+                      <ExternalLink className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                    </a>
+                  </div>
+                )}
+
+                {/* Stage 5: Edition-level Historical Correction Notice (visible even before selecting a state) */}
+                {(activeCorrectionChain.hasSubsequentCorrection || activeCorrectionChain.isCorrectedVersion) && (
+                  <div
+                    role="note"
+                    aria-label="Edition editorial correction notice"
+                    className="mt-1 rounded-md border border-amber-300 bg-amber-50 p-3 text-xs text-amber-950 space-y-1.5 min-w-0"
+                  >
+                    <div className="flex items-start gap-2 min-w-0">
+                      <GitBranch className="w-4 h-4 text-amber-800 shrink-0 mt-0.5" aria-hidden="true" />
+                      <div className="min-w-0 flex-1 space-y-1.5">
+                        {activeCorrectionChain.hasSubsequentCorrection && activeCorrectionChain.latestCorrection ? (
+                          <>
+                            <p className="m-0 font-semibold break-words">
+                              Preserved original edition — A later editorial correction (r
+                              {activeCorrectionChain.latestCorrection.revisionNumber || 2}) was published
+                              {activeCorrectionChain.correctionDateLabel
+                                ? ` on ${activeCorrectionChain.correctionDateLabel}`
+                                : ''}
+                              . {activeCorrectionChain.editorialClarityNote}
+                            </p>
+                            <a
+                              href={buildHistoricalPermalinkForSelectedState(activeCorrectionChain.latestCorrection.id)}
+                              onClick={(e) => {
+                                e.preventDefault();
+                                selectEditionAndSyncUrl(activeCorrectionChain.latestCorrection!.id);
+                              }}
+                              className="inline-flex items-center gap-1 font-semibold text-amber-950 underline hover:text-amber-800"
+                            >
+                              Open corrected revision (r{activeCorrectionChain.latestCorrection.revisionNumber || 2}) →
+                            </a>
+                          </>
+                        ) : (
+                          <>
+                            <p className="m-0 font-semibold break-words">
+                              Corrected edition (Revision r{activeCorrectionChain.revisionNumber}).{' '}
+                              {activeCorrectionChain.revisionNote ? `${activeCorrectionChain.revisionNote} ` : ''}
+                              {activeCorrectionChain.editorialClarityNote}
+                            </p>
+                            {activeCorrectionChain.originalEdition && (
+                              <a
+                                href={buildHistoricalPermalinkForSelectedState(activeCorrectionChain.originalEdition.id)}
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  selectEditionAndSyncUrl(activeCorrectionChain.originalEdition!.id);
+                                }}
+                                className="inline-flex items-center gap-1 font-semibold text-amber-950 underline hover:text-amber-800"
+                              >
+                                View preserved original edition →
+                              </a>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </section>
+            )}
+
+            {/* 7. Mobile Quick-Jump Navigation Strip (Access to Date Selection, Evidence, Archive, Legend & Methodology) */}
+            {!isEmbedded && !hideAside && (
+              <nav
+                aria-label="Jump to DCM page sections"
+                className="lg:hidden grid grid-cols-2 sm:grid-cols-5 gap-2"
+              >
+                <a
+                  href="#dcm-date-selector"
+                  className="min-h-[44px] flex items-center justify-center px-3 py-2 bg-white border border-[#d5d9de] rounded-md text-xs font-semibold text-[#1c232b] no-underline hover:bg-slate-50 text-center"
+                >
+                  Change date
+                </a>
+                <a
+                  href="#dcm-state-info"
+                  className="min-h-[44px] flex items-center justify-center px-3 py-2 bg-white border border-[#d5d9de] rounded-md text-xs font-semibold text-[#1c232b] no-underline hover:bg-slate-50 text-center"
+                >
+                  State evidence
+                </a>
+                <a
+                  href="#dcm-archive-section"
+                  className="min-h-[44px] flex items-center justify-center px-3 py-2 bg-white border border-[#d5d9de] rounded-md text-xs font-semibold text-[#1c232b] no-underline hover:bg-slate-50 text-center"
+                >
+                  Daily archive
+                </a>
+                <a
+                  href="#dcm-colour-legend"
+                  className="min-h-[44px] flex items-center justify-center px-3 py-2 bg-white border border-[#d5d9de] rounded-md text-xs font-semibold text-[#1c232b] no-underline hover:bg-slate-50 text-center"
+                >
+                  Colour legend
+                </a>
+                <a
+                  href="#dcm-about-section"
+                  className="col-span-2 sm:col-span-1 min-h-[44px] flex items-center justify-center px-3 py-2 bg-white border border-[#d5d9de] rounded-md text-xs font-semibold text-[#1c232b] no-underline hover:bg-slate-50 text-center"
+                >
+                  Methodology
+                </a>
+              </nav>
+            )}
+          </div>
+
+          {/* RIGHT / SECONDARY COLUMN: Publication Selector, State Search & Stage 3 Evidence Panel */}
           {!hideAside && (
           <aside
-            aria-label="Map controls and state trend"
-            style={{
-              flex: '1 1 400px',
-              minWidth: 0,
-              background: '#ffffff',
-              border: '1px solid #d5d9de',
-              borderRadius: '6px',
-              padding: '20px',
-              display: 'flex',
-              flexDirection: 'column',
-              gap: '26px'
-            }}
+            aria-label="Map controls and state evidence"
+            className="min-w-0 bg-white border border-[#d5d9de] rounded-md p-4 sm:p-5 flex flex-col gap-6"
           >
-            {/* View a published map */}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-              <h2 style={{ margin: 0, fontSize: '18px', fontWeight: 700 }}>
+            {/* View a published map (Single Full-Width Selector on Mobile/Tablet; 3-column Year/Month/Period preserved on Desktop) */}
+            <div id="dcm-date-selector" className="flex flex-col gap-3 scroll-mt-6 min-w-0">
+              <h2 className="m-0 text-lg font-bold text-[#1c232b]">
                 View a published map
               </h2>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: '10px' }}>
+
+              {/* Mobile & Tablet (<1024px): Single readable full-width publication selector (zero clipping) */}
+              <div className="flex flex-col gap-1.5 lg:hidden min-w-0">
+                <label htmlFor="dcm-mobile-publication" className="text-sm font-semibold text-[#1c232b]">
+                  Published edition
+                </label>
+                <select
+                  id="dcm-mobile-publication"
+                  value={activePub.id}
+                  onChange={handlePeriodChange}
+                  className="w-full min-h-[44px] px-3 py-2 text-sm border border-[#8a939c] rounded bg-white text-[#1c232b] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#1f5fa8]"
+                >
+                  {unifiedPubOptions.map((opt) => (
+                    <option key={opt.id} value={opt.id}>
+                      {opt.label}{opt.isLatest ? ' — Latest' : ''}
+                    </option>
+                  ))}
+                </select>
+                <span className="text-xs text-[#3d4752]">
+                  Select any published daily update or historical reporting period.
+                </span>
+              </div>
+
+              {/* Desktop (1024px+): Preserved Year / Month / Period controls */}
+              <div className="hidden lg:grid lg:grid-cols-3 gap-2.5 min-w-0">
                 {/* Year Select */}
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', minWidth: 0 }}>
-                  <label htmlFor="dcm-year" style={{ fontSize: '14px', fontWeight: 600 }}>
+                <div className="flex flex-col gap-1 min-w-0">
+                  <label htmlFor="dcm-year" className="text-sm font-semibold">
                     Year
                   </label>
                   <select
                     id="dcm-year"
                     value={activePub.year}
                     onChange={handleYearChange}
-                    style={{
-                      font: 'inherit',
-                      fontSize: '15px',
-                      minHeight: '44px',
-                      padding: '6px 8px',
-                      border: '1px solid #8a939c',
-                      borderRadius: '4px',
-                      background: '#ffffff',
-                      color: '#1c232b',
-                      minWidth: 0
-                    }}
+                    className="w-full min-w-0 min-h-[44px] px-2 py-1.5 text-[15px] border border-[#8a939c] rounded bg-white text-[#1c232b]"
                   >
                     {years.map((y) => (
                       <option key={y} value={y}>{y}</option>
@@ -1773,25 +2241,15 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
                 </div>
 
                 {/* Month Select */}
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', minWidth: 0 }}>
-                  <label htmlFor="dcm-month" style={{ fontSize: '14px', fontWeight: 600 }}>
+                <div className="flex flex-col gap-1 min-w-0">
+                  <label htmlFor="dcm-month" className="text-sm font-semibold">
                     Month
                   </label>
                   <select
                     id="dcm-month"
                     value={activePub.month}
                     onChange={handleMonthChange}
-                    style={{
-                      font: 'inherit',
-                      fontSize: '15px',
-                      minHeight: '44px',
-                      padding: '6px 8px',
-                      border: '1px solid #8a939c',
-                      borderRadius: '4px',
-                      background: '#ffffff',
-                      color: '#1c232b',
-                      minWidth: 0
-                    }}
+                    className="w-full min-w-0 min-h-[44px] px-2 py-1.5 text-[15px] border border-[#8a939c] rounded bg-white text-[#1c232b]"
                   >
                     {monthsInYear.map((m) => (
                       <option key={m} value={m}>{DCM_MONTHS[m]}</option>
@@ -1800,25 +2258,15 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
                 </div>
 
                 {/* Period Select */}
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', minWidth: 0 }}>
-                  <label htmlFor="dcm-period" style={{ fontSize: '14px', fontWeight: 600 }}>
+                <div className="flex flex-col gap-1 min-w-0">
+                  <label htmlFor="dcm-period" className="text-sm font-semibold">
                     Period
                   </label>
                   <select
                     id="dcm-period"
-                    value={pi}
+                    value={activePub.id}
                     onChange={handlePeriodChange}
-                    style={{
-                      font: 'inherit',
-                      fontSize: '15px',
-                      minHeight: '44px',
-                      padding: '6px 8px',
-                      border: '1px solid #8a939c',
-                      borderRadius: '4px',
-                      background: '#ffffff',
-                      color: '#1c232b',
-                      minWidth: 0
-                    }}
+                    className="w-full min-w-0 min-h-[44px] px-2 py-1.5 text-[15px] border border-[#8a939c] rounded bg-white text-[#1c232b]"
                   >
                     {periodOpts.map((o) => (
                       <option key={o.value} value={o.value}>{o.label}</option>
@@ -2008,39 +2456,24 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
                       </span>
                     </div>
 
-                    {/* State Evidence & Classification Metadata */}
-                    {(() => {
-                      const selDetails = getStateDetails(activePub, prevPub, sel);
-                      return (
-                        <div
-                          style={{
-                            background: '#f8fafc',
-                            border: '1px solid #e2e8f0',
-                            borderRadius: '6px',
-                            padding: '12px 14px',
-                            display: 'flex',
-                            flexDirection: 'column',
-                            gap: '6px',
-                            fontSize: '13px',
-                            lineHeight: 1.45,
-                            marginTop: '4px'
-                          }}
-                        >
-                          <div>
-                            <strong style={{ color: '#1e293b' }}>Direction: </strong>
-                            <span style={{ color: '#334155' }}>{selDetails.direction}</span>
-                          </div>
-                          <div>
-                            <strong style={{ color: '#1e293b' }}>Confidence: </strong>
-                            <span style={{ color: '#334155' }}>{selDetails.confidence}</span>
-                          </div>
-                          <div>
-                            <strong style={{ color: '#1e293b' }}>Key Finding: </strong>
-                            <span style={{ color: '#334155' }}>{selDetails.keyFinding}</span>
-                          </div>
-                        </div>
-                      );
-                    })()}
+                    {/* Stage 3 & Stage 5 Enhanced State Assessment Panel (Permalinks, Correction Notices, Sections A–E) */}
+                    {selectedStatePanelData && (
+                      <DcmStateAssessmentPanel
+                        panelData={selectedStatePanelData}
+                        selectedPeriodLabel={activePub.short}
+                        evidenceCutoffLabel={activePub.cutoff || 'Not recorded'}
+                        publicationDateLabel={
+                          selectionResolution.activePublication?.publicationDate || activePub.short
+                        }
+                        statePermalinkUrl={activeStatePermalink}
+                        absolutePermalinkUrl={activeAbsoluteStatePermalink}
+                        correctionChain={activeCorrectionChain}
+                        buildHistoricalPermalink={buildHistoricalPermalinkForSelectedState}
+                        onSelectHistoricalEdition={(pubId) => {
+                          selectEditionAndSyncUrl(pubId);
+                        }}
+                      />
+                    )}
                   </div>
 
                   {/* Year Trend Grid */}
@@ -2075,9 +2508,8 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
                               type="button"
                               disabled={h.disabled}
                               onClick={() => {
-                                if (!h.disabled && h.pubIdx >= 0) {
-                                  setHasManualSelection(true);
-                                  setPi(h.pubIdx);
+                                if (!h.disabled && h.pubId) {
+                                  selectEditionAndSyncUrl(h.pubId);
                                 }
                               }}
                               aria-label={h.aria}
@@ -2102,16 +2534,10 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
                     {/* Month Abbreviations */}
                     <div
                       aria-hidden="true"
-                      style={{
-                        display: 'grid',
-                        gridTemplateColumns: 'repeat(12, minmax(0, 1fr))',
-                        fontSize: '11px',
-                        color: '#3d4752',
-                        textAlign: 'center'
-                      }}
+                      className="grid grid-cols-12 text-[9px] sm:text-[11px] leading-tight text-[#3d4752] text-center overflow-hidden"
                     >
                       {monthTrends.map((m) => (
-                        <span key={m.name}>{m.abbr}</span>
+                        <span key={m.name} className="min-w-0 truncate">{m.abbr}</span>
                       ))}
                     </div>
 
@@ -2169,88 +2595,68 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
           )}
         </div>
 
-        {/* DCM Explanatory Section (Standalone DCM Page) */}
+        {/* Stage 5: Daily & Historical DCM Publication Archive (Month/Year Navigation, 15th & Month-End Comparison Points, Permanent Snapshot Links) */}
+        {!isEmbedded && !hideAside && (
+          <DcmArchiveSection
+            publishedPublications={publishedCanonical}
+            activePublicationId={activePub.id}
+            activeYear={activePub.year}
+            activeMonth={activePub.month + 1}
+            selectedStateName={sel}
+            onSelectArchiveEdition={(pubId, nextState) => {
+              selectEditionAndSyncUrl(pubId, nextState, true);
+            }}
+            onLoadArchiveMonth={loadDcmArchiveMonth}
+          />
+        )}
+
+        {/* DCM Explanatory, Legend Definitions & Methodology Section (Positioned below main map experience) */}
         {!isEmbedded && (
           <section
+            id="dcm-about-section"
             aria-label="About the Democratic Competitiveness Map"
-            className="bg-white border border-line rounded-2xl p-6 sm:p-10 space-y-8 shadow-sm"
+            className="bg-white border border-line rounded-xl sm:rounded-2xl p-4 sm:p-8 lg:p-10 space-y-6 sm:space-y-8 shadow-sm min-w-0 scroll-mt-6"
           >
-            <div className="space-y-6 text-ink2 text-base leading-relaxed">
-              <h2 className="font-display font-bold text-2xl text-ink">What is DCM?</h2>
-              <p>
-                The Democratic Competitiveness Map (DCM) is the Athena Election Observatory’s evidence-based system for monitoring the conditions under which legitimate political actors compete across Nigeria’s thirty-six states and the Federal Capital Territory.
-              </p>
-              <p>
-                A credible election requires more than a credible election day. Political actors must also have a practical opportunity to organise, communicate, move, assemble and compete before voters cast their ballots.
-              </p>
-              <p>
-                Election integrity examines whether voting, counting and collation reflect the will of voters. The DCM examines the environment in which political actors compete, whether the political actors have a reasonably open and fair opportunity to compete for those votes.
-              </p>
-              <p>
-                The DCM assesses whether political parties, candidates and other legitimate political actors can organise, communicate, mobilise, move, campaign, access relevant institutions and participate in political competition under conditions of political pluralism, institutional neutrality, legal certainty and practical fairness.
-              </p>
-            </div>
+            {/* 1. How do the colours work? (Always visible on mobile & desktop; stacked cards on mobile, table on md+) */}
+            <div id="dcm-colour-legend" className="space-y-4 sm:space-y-5 text-ink2 text-sm sm:text-base leading-relaxed scroll-mt-6 min-w-0">
+              <div className="space-y-2">
+                <h2 className="font-display font-bold text-xl sm:text-2xl text-ink m-0">
+                  How do the colours work?
+                </h2>
+                <p className="m-0">
+                  The DCM uses five colour classifications. The colours are evidence-based and time-bound; they are not permanent labels assigned to states.
+                </p>
+                <p className="m-0 text-sm font-semibold text-[#1c232b] bg-slate-50 border border-slate-200 rounded-md px-3.5 py-2.5">
+                  {INSUFFICIENT_EVIDENCE_DISCLAIMER}
+                </p>
+              </div>
 
-            <div className="space-y-6 text-ink2 text-base leading-relaxed border-t border-line pt-8">
-              <h2 className="font-display font-bold text-2xl text-ink">What does it track?</h2>
-              <p>The DCM tracks five dimensions of the political competition environment:</p>
-              <ul className="list-disc pl-6 space-y-3">
-                <li>
-                  <strong className="text-ink">Political Space — Freedom of Association and Movement:</strong> Whether political actors can organise, assemble, move and campaign without unjustified or discriminatory restrictions.
-                </li>
-                <li>
-                  <strong className="text-ink">Freedom of Speech and Expression:</strong> Whether political actors can communicate, campaign and express political positions without materially restrictive interference.
-                </li>
-                <li>
-                  <strong className="text-ink">Administrative and Regulatory Neutrality:</strong> Whether administrative, regulatory and legal powers are applied impartially and without creating discriminatory competitive effects.
-                </li>
-                <li>
-                  <strong className="text-ink">Security Neutrality:</strong> Whether police and security institutions protect lawful political activity and enforce applicable rules impartially across political actors.
-                </li>
-                <li>
-                  <strong className="text-ink">Political Intimidation and Violence:</strong> Whether threats, coercion or violence materially restrict political actors from participating in political competition.
-                </li>
-              </ul>
-            </div>
+              {/* Mobile Stacked Colour Definitions (<768px — zero horizontal clipping or scroll) */}
+              <div className="md:hidden space-y-3" aria-label="Classification colour definitions">
+                {DCM_LEGEND_DEFINITIONS.map((item) => (
+                  <div
+                    key={item.code}
+                    className="bg-slate-50 border border-slate-200 rounded-lg p-3.5 space-y-1.5 min-w-0"
+                  >
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <span
+                        aria-hidden="true"
+                        className="w-4 h-4 rounded-[3px] border border-[#8a939c] shrink-0 inline-block"
+                        style={{ backgroundColor: item.hex }}
+                      />
+                      <span className="font-bold text-sm text-[#1c232b] break-words">
+                        {item.colourName} — {item.classification}
+                      </span>
+                    </div>
+                    <p className="m-0 text-xs sm:text-sm text-[#3d4752] leading-relaxed break-words">
+                      {item.definition}
+                    </p>
+                  </div>
+                ))}
+              </div>
 
-            <div className="space-y-6 text-ink2 text-base leading-relaxed border-t border-line pt-8">
-              <h2 className="font-display font-bold text-2xl text-ink">What does it seek to achieve?</h2>
-              <p>The DCM is designed to:</p>
-              <ul className="list-disc pl-6 space-y-3">
-                <li>Provide an evidence-based picture of political competition conditions across Nigeria before election day.</li>
-                <li>Identify emerging restrictions and pressure points that may affect the ability of political actors to compete.</li>
-                <li>Track changes in competitive conditions over time, including whether conditions improve, deteriorate or remain unchanged.</li>
-                <li>Make the evidence behind each classification transparent and traceable, allowing users to examine the basis for a state’s classification.</li>
-                <li>Highlight areas requiring closer attention from political actors, institutions, civil society, researchers and other stakeholders as elections approach.</li>
-              </ul>
-            </div>
-
-            <div className="space-y-6 text-ink2 text-base leading-relaxed border-t border-line pt-8">
-              <h2 className="font-display font-bold text-2xl text-ink">What is it not?</h2>
-              <p>The DCM:</p>
-              <ul className="list-disc pl-6 space-y-3">
-                <li>Does not rank states or political parties.</li>
-                <li>Does not assign numerical scores, weights or composite values.</li>
-                <li>Does not measure political popularity, vote share or predict electoral outcomes.</li>
-                <li>Does not assess whether a court reached the correct legal conclusion.</li>
-                <li>Does not treat allegations as established facts without sufficient verification.</li>
-                <li>Is not a general democracy, governance or civil-liberties index.</li>
-                <li>Does not equate limited reporting or lack of evidence with an open political environment.</li>
-                <li>Does not replace AEO’s election-day monitoring or Post-Election Audit workstreams.</li>
-              </ul>
-              <p className="mt-4">
-                Each colour represents the current state of evidence for a defined reporting period, rather than a permanent judgment about a state. Classifications can change as conditions change, restrictions are remedied, or stronger evidence becomes available.
-              </p>
-            </div>
-
-            <div className="space-y-6 text-ink2 text-base leading-relaxed border-t border-line pt-8">
-              <h2 className="font-display font-bold text-2xl text-ink">How do the colours work?</h2>
-              <p>
-                The DCM uses five colour classifications. The colours are evidence-based and time-bound; they are not permanent labels assigned to states.
-              </p>
-
-              {/* Responsive Colours Table */}
-              <div className="overflow-x-auto my-6 border border-line rounded-xl">
+              {/* Tablet & Desktop Table (768px+ — preserved horizontal colour table with canonical hex swatches) */}
+              <div className="hidden md:block overflow-x-auto my-4 border border-line rounded-xl">
                 <table className="w-full text-left border-collapse text-sm">
                   <thead>
                     <tr className="bg-paper border-b border-line text-ink font-mono text-xs uppercase">
@@ -2260,68 +2666,156 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-line text-ink2">
-                    <tr className="hover:bg-paper/50">
-                      <td className="p-4 font-semibold text-ink align-top whitespace-nowrap">
-                        <span className="inline-flex items-center gap-2">
-                          <span className="w-3.5 h-3.5 rounded-full bg-emerald-500 inline-block shrink-0" />
-                          Green
-                        </span>
-                      </td>
-                      <td className="p-4 font-bold text-ink align-top">Open</td>
-                      <td className="p-4">
-                        Affirmative and sufficiently broad evidence indicates broadly equal practical political access during the reporting period, with political actors able to organise, communicate, mobilise and campaign without verified material or discriminatory restrictions. No verified pattern of material restriction remains at the cut-off date. Absence of adverse reporting or insufficient evidence is not, by itself, grounds for a Green classification.
-                      </td>
-                    </tr>
-                    <tr className="hover:bg-paper/50">
-                      <td className="p-4 font-semibold text-ink align-top whitespace-nowrap">
-                        <span className="inline-flex items-center gap-2">
-                          <span className="w-3.5 h-3.5 rounded-full bg-amber-400 inline-block shrink-0" />
-                          Amber
-                        </span>
-                      </td>
-                      <td className="p-4 font-bold text-ink align-top">Emerging Concern</td>
-                      <td className="p-4">
-                        A material incident or early evidence of unequal treatment requires monitoring, but the evidence does not yet establish a sustained or substantial restrictive pattern.
-                      </td>
-                    </tr>
-                    <tr className="hover:bg-paper/50">
-                      <td className="p-4 font-semibold text-ink align-top whitespace-nowrap">
-                        <span className="inline-flex items-center gap-2">
-                          <span className="w-3.5 h-3.5 rounded-full bg-orange-500 inline-block shrink-0" />
-                          Orange
-                        </span>
-                      </td>
-                      <td className="p-4 font-bold text-ink align-top">Constrained</td>
-                      <td className="p-4">
-                        Multiple verified incidents, an identifiable pattern, or an exceptionally serious and well-documented action materially restricts political competition.
-                      </td>
-                    </tr>
-                    <tr className="hover:bg-paper/50">
-                      <td className="p-4 font-semibold text-ink align-top whitespace-nowrap">
-                        <span className="inline-flex items-center gap-2">
-                          <span className="w-3.5 h-3.5 rounded-full bg-red-600 inline-block shrink-0" />
-                          Red
-                        </span>
-                      </td>
-                      <td className="p-4 font-bold text-ink align-top">Severely Constrained</td>
-                      <td className="p-4">
-                        Serious, sustained or systemic restrictions substantially impair political competition, taking into account their severity, reach, institutional authority and consequences.
-                      </td>
-                    </tr>
-                    <tr className="hover:bg-paper/50">
-                      <td className="p-4 font-semibold text-ink align-top whitespace-nowrap">
-                        <span className="inline-flex items-center gap-2">
-                          <span className="w-3.5 h-3.5 rounded-full bg-slate-300 inline-block shrink-0" />
-                          Grey
-                        </span>
-                      </td>
-                      <td className="p-4 font-bold text-ink align-top">Insufficient Evidence</td>
-                      <td className="p-4">
-                        Available evidence is inadequate to make a responsible classification. Importantly, insufficient evidence does not mean that political competition is open.
-                      </td>
-                    </tr>
+                    {DCM_LEGEND_DEFINITIONS.map((item) => (
+                      <tr key={item.code} className="hover:bg-paper/50">
+                        <td className="p-4 font-semibold text-ink align-top whitespace-nowrap">
+                          <span className="inline-flex items-center gap-2">
+                            <span
+                              aria-hidden="true"
+                              className="w-3.5 h-3.5 rounded-[3px] border border-[#8a939c] inline-block shrink-0"
+                              style={{ backgroundColor: item.hex }}
+                            />
+                            {item.colourName}
+                          </span>
+                        </td>
+                        <td className="p-4 font-bold text-ink align-top">{item.classification}</td>
+                        <td className="p-4">{item.definition}</td>
+                      </tr>
+                    ))}
                   </tbody>
                 </table>
+              </div>
+            </div>
+
+            {/* 2. What is DCM? (Collapsible on mobile <1024px, always open on desktop lg+) */}
+            <div className="border-t border-line pt-5 sm:pt-7 min-w-0">
+              <button
+                type="button"
+                aria-expanded={Boolean(openExplanatoryMobile.whatIsDcm)}
+                onClick={() => toggleExplanatoryMobile('whatIsDcm')}
+                className="lg:hidden w-full min-h-[44px] flex items-center justify-between gap-2 text-left bg-transparent border-0 p-0 cursor-pointer"
+              >
+                <span className="font-display font-bold text-lg text-ink">What is DCM?</span>
+                {openExplanatoryMobile.whatIsDcm ? (
+                  <ChevronUp className="w-5 h-5 text-slate-600 shrink-0" aria-hidden="true" />
+                ) : (
+                  <ChevronDown className="w-5 h-5 text-slate-600 shrink-0" aria-hidden="true" />
+                )}
+              </button>
+              <h2 className="hidden lg:block font-display font-bold text-2xl text-ink mb-4">What is DCM?</h2>
+              <div className={`${openExplanatoryMobile.whatIsDcm ? 'block mt-3' : 'hidden'} lg:block space-y-4 text-ink2 text-sm sm:text-base leading-relaxed`}>
+                <p className="m-0">
+                  The Democratic Competitiveness Map (DCM) is the Athena Election Observatory’s evidence-based system for monitoring the conditions under which legitimate political actors compete across Nigeria’s thirty-six states and the Federal Capital Territory.
+                </p>
+                <p className="m-0">
+                  A credible election requires more than a credible election day. Political actors must also have a practical opportunity to organise, communicate, move, assemble and compete before voters cast their ballots.
+                </p>
+                <p className="m-0">
+                  Election integrity examines whether voting, counting and collation reflect the will of voters. The DCM examines the environment in which political actors compete, whether the political actors have a reasonably open and fair opportunity to compete for those votes.
+                </p>
+                <p className="m-0">
+                  The DCM assesses whether political parties, candidates and other legitimate political actors can organise, communicate, mobilise, move, campaign, access relevant institutions and participate in political competition under conditions of political pluralism, institutional neutrality, legal certainty and practical fairness.
+                </p>
+              </div>
+            </div>
+
+            {/* 3. What does it track? */}
+            <div className="border-t border-line pt-5 sm:pt-7 min-w-0">
+              <button
+                type="button"
+                aria-expanded={Boolean(openExplanatoryMobile.whatTracks)}
+                onClick={() => toggleExplanatoryMobile('whatTracks')}
+                className="lg:hidden w-full min-h-[44px] flex items-center justify-between gap-2 text-left bg-transparent border-0 p-0 cursor-pointer"
+              >
+                <span className="font-display font-bold text-lg text-ink">What does it track?</span>
+                {openExplanatoryMobile.whatTracks ? (
+                  <ChevronUp className="w-5 h-5 text-slate-600 shrink-0" aria-hidden="true" />
+                ) : (
+                  <ChevronDown className="w-5 h-5 text-slate-600 shrink-0" aria-hidden="true" />
+                )}
+              </button>
+              <h2 className="hidden lg:block font-display font-bold text-2xl text-ink mb-4">What does it track?</h2>
+              <div className={`${openExplanatoryMobile.whatTracks ? 'block mt-3' : 'hidden'} lg:block space-y-4 text-ink2 text-sm sm:text-base leading-relaxed`}>
+                <p className="m-0">The DCM tracks five dimensions of the political competition environment:</p>
+                <ul className="list-disc pl-5 sm:pl-6 space-y-2.5 m-0">
+                  <li>
+                    <strong className="text-ink">Political Space — Freedom of Association and Movement:</strong> Whether political actors can organise, assemble, move and campaign without unjustified or discriminatory restrictions.
+                  </li>
+                  <li>
+                    <strong className="text-ink">Freedom of Speech and Expression:</strong> Whether political actors can communicate, campaign and express political positions without materially restrictive interference.
+                  </li>
+                  <li>
+                    <strong className="text-ink">Administrative and Regulatory Neutrality:</strong> Whether administrative, regulatory and legal powers are applied impartially and without creating discriminatory competitive effects.
+                  </li>
+                  <li>
+                    <strong className="text-ink">Security Neutrality:</strong> Whether police and security institutions protect lawful political activity and enforce applicable rules impartially across political actors.
+                  </li>
+                  <li>
+                    <strong className="text-ink">Political Intimidation and Violence:</strong> Whether threats, coercion or violence materially restrict political actors from participating in political competition.
+                  </li>
+                </ul>
+              </div>
+            </div>
+
+            {/* 4. What does it seek to achieve? */}
+            <div className="border-t border-line pt-5 sm:pt-7 min-w-0">
+              <button
+                type="button"
+                aria-expanded={Boolean(openExplanatoryMobile.whatAchieves)}
+                onClick={() => toggleExplanatoryMobile('whatAchieves')}
+                className="lg:hidden w-full min-h-[44px] flex items-center justify-between gap-2 text-left bg-transparent border-0 p-0 cursor-pointer"
+              >
+                <span className="font-display font-bold text-lg text-ink">What does it seek to achieve?</span>
+                {openExplanatoryMobile.whatAchieves ? (
+                  <ChevronUp className="w-5 h-5 text-slate-600 shrink-0" aria-hidden="true" />
+                ) : (
+                  <ChevronDown className="w-5 h-5 text-slate-600 shrink-0" aria-hidden="true" />
+                )}
+              </button>
+              <h2 className="hidden lg:block font-display font-bold text-2xl text-ink mb-4">What does it seek to achieve?</h2>
+              <div className={`${openExplanatoryMobile.whatAchieves ? 'block mt-3' : 'hidden'} lg:block space-y-4 text-ink2 text-sm sm:text-base leading-relaxed`}>
+                <p className="m-0">The DCM is designed to:</p>
+                <ul className="list-disc pl-5 sm:pl-6 space-y-2.5 m-0">
+                  <li>Provide an evidence-based picture of political competition conditions across Nigeria before election day.</li>
+                  <li>Identify emerging restrictions and pressure points that may affect the ability of political actors to compete.</li>
+                  <li>Track changes in competitive conditions over time, including whether conditions improve, deteriorate or remain unchanged.</li>
+                  <li>Make the evidence behind each classification transparent and traceable, allowing users to examine the basis for a state’s classification.</li>
+                  <li>Highlight areas requiring closer attention from political actors, institutions, civil society, researchers and other stakeholders as elections approach.</li>
+                </ul>
+              </div>
+            </div>
+
+            {/* 5. What is it not? */}
+            <div className="border-t border-line pt-5 sm:pt-7 min-w-0">
+              <button
+                type="button"
+                aria-expanded={Boolean(openExplanatoryMobile.whatNot)}
+                onClick={() => toggleExplanatoryMobile('whatNot')}
+                className="lg:hidden w-full min-h-[44px] flex items-center justify-between gap-2 text-left bg-transparent border-0 p-0 cursor-pointer"
+              >
+                <span className="font-display font-bold text-lg text-ink">What is it not?</span>
+                {openExplanatoryMobile.whatNot ? (
+                  <ChevronUp className="w-5 h-5 text-slate-600 shrink-0" aria-hidden="true" />
+                ) : (
+                  <ChevronDown className="w-5 h-5 text-slate-600 shrink-0" aria-hidden="true" />
+                )}
+              </button>
+              <h2 className="hidden lg:block font-display font-bold text-2xl text-ink mb-4">What is it not?</h2>
+              <div className={`${openExplanatoryMobile.whatNot ? 'block mt-3' : 'hidden'} lg:block space-y-4 text-ink2 text-sm sm:text-base leading-relaxed`}>
+                <p className="m-0">The DCM:</p>
+                <ul className="list-disc pl-5 sm:pl-6 space-y-2.5 m-0">
+                  <li>Does not rank states or political parties.</li>
+                  <li>Does not assign numerical scores, weights or composite values.</li>
+                  <li>Does not measure political popularity, vote share or predict electoral outcomes.</li>
+                  <li>Does not assess whether a court reached the correct legal conclusion.</li>
+                  <li>Does not treat allegations as established facts without sufficient verification.</li>
+                  <li>Is not a general democracy, governance or civil-liberties index.</li>
+                  <li>Does not equate limited reporting or lack of evidence with an open political environment.</li>
+                  <li>Does not replace AEO’s election-day monitoring or Post-Election Audit workstreams.</li>
+                </ul>
+                <p className="mt-3 mb-0">
+                  Each colour represents the current state of evidence for a defined reporting period, rather than a permanent judgment about a state. Classifications can change as conditions change, restrictions are remedied, or stronger evidence becomes available.
+                </p>
               </div>
             </div>
           </section>

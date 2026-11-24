@@ -1,0 +1,10 @@
+{
+  "_comment": "ISOLATED STAGING TEMPLATE ONLY — NEVER use gen-lang-client-0961551337 or aeo-database19 here.",
+  "projectId": "<DEDICATED_STAGING_FIREBASE_PROJECT_ID>",
+  "appId": "<DEDICATED_STAGING_WEB_APP_ID>",
+  "apiKey": "<DEDICATED_STAGING_WEB_API_KEY>",
+  "authDomain": "<DEDICATED_STAGING_FIREBASE_PROJECT_ID>.firebaseapp.com",
+  "firestoreDatabaseId": "<DEDICATED_STAGING_FIRESTORE_DATABASE_ID>",
+  "storageBucket": "<DEDICATED_STAGING_FIREBASE_PROJECT_ID>.firebasestorage.app",
+  "messagingSenderId": "<DEDICATED_STAGING_MESSAGING_SENDER_ID>"
+}

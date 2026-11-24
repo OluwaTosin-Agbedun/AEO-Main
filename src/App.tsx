@@ -55,7 +55,8 @@ export default function App() {
 
   useEffect(() => {
     if (path === '/democracy-competitive-index' || path === '/publications/democracy-competitive-index') {
-      window.history.replaceState({}, '', '/democratic-competitiveness-map');
+      const preservedSearch = window.location.search || '';
+      window.history.replaceState({}, '', `/democratic-competitiveness-map${preservedSearch}`);
       setPath('/democratic-competitiveness-map');
     }
   }, [path]);

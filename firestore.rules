@@ -1,15 +1,14 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Global Safety Net - allow read for site content, default deny write
+    // Global Safety Net - default deny all reads and writes unless explicitly matched below
     match /{document=**} {
-      allow read: if true;
-      allow write: if false;
+      allow read, write: if false;
     }
 
     // Reusable global helper functions
     function isValidId(id) {
-      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+      return id is string && id.size() >= 3 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
     function isSignedIn() {
@@ -20,26 +19,716 @@ service cloud.firestore {
       return request.resource.data;
     }
 
+    function existing() {
+      return resource.data;
+    }
+
+    // Authorised AEO Administrator check (Owner UID or Active record in /cms_admins)
+    function isAuthorizedAdmin() {
+      return isSignedIn() && (
+        request.auth.uid == 's39PbuZxqdW1x63i0SsEVE7HqGQ2' ||
+        (
+          exists(/databases/$(database)/documents/cms_admins/$(request.auth.uid)) &&
+          get(/databases/$(database)/documents/cms_admins/$(request.auth.uid)).data.status == 'Active'
+        )
+      );
+    }
+
     function isValidSubscriber(data) {
-      return data.email is string 
-          && data.email.size() <= 128 
-          && data.channels is list 
+      return data.email is string
+          && data.email.size() <= 128
+          && data.channels is list
           && data.subscribedAt is string;
+    }
+
+    // Blueprint validator for /dcm_daily_publications/{publicationId}
+    // Stage 2 safeguard: requires a documented Research approval reference AND binds the
+    // recording administrator's authenticated UID + timestamp so a manually typed approver
+    // name alone is never accepted as verification.
+    function isValidDcmDailyApproval(approval) {
+      return approval is map
+          && approval.keys().hasAll([
+            'approved',
+            'approvalReference',
+            'approvedByName',
+            'approvedAt',
+            'recordedByUid',
+            'recordedAt'
+          ])
+          && approval.keys().hasOnly([
+            'approved',
+            'approvalReference',
+            'approvedByName',
+            'approvedAt',
+            'recordedByUid',
+            'recordedByEmail',
+            'recordedAt',
+            'verificationMode',
+            'approvedByUid',
+            'approvedByEmail',
+            'notes'
+          ])
+          && approval.approved == true
+          && approval.approvalReference is string
+          && approval.approvalReference.size() >= 3
+          && approval.approvalReference.size() <= 128
+          && approval.approvedByName is string
+          && approval.approvedByName.size() >= 2
+          && approval.approvedByName.size() <= 128
+          && approval.approvedAt is string
+          && approval.approvedAt.size() >= 10
+          && approval.approvedAt.size() <= 64
+          && approval.recordedByUid is string
+          && approval.recordedByUid == request.auth.uid
+          && approval.recordedAt is string
+          && approval.recordedAt.size() >= 10
+          && approval.recordedAt.size() <= 64
+          && (!('recordedByEmail' in approval) || (approval.recordedByEmail is string && approval.recordedByEmail.size() <= 128))
+          && (!('approvedByUid' in approval) || (approval.approvedByUid is string && approval.approvedByUid == request.auth.uid))
+          && (!('approvedByEmail' in approval) || (approval.approvedByEmail is string && approval.approvedByEmail.size() <= 128))
+          && (!('verificationMode' in approval) || approval.verificationMode == 'admin-recorded-reference')
+          && (!('notes' in approval) || (approval.notes is string && approval.notes.size() <= 500));
+    }
+
+    function isValidDcmDailyPublication(data) {
+      return data.keys().hasAll([
+            'id',
+            'publicationFormat',
+            'title',
+            'year',
+            'month',
+            'periodIndex',
+            'periodStart',
+            'periodEnd',
+            'reportingPeriodLabel',
+            'publicationDate',
+            'evidenceCutoffDate',
+            'assessmentDate',
+            'evidenceCutoffTimeWat',
+            'evidenceCutoffDateTimeWat',
+            'methodologyVersion',
+            'status',
+            'isLatest',
+            'summary',
+            'classifications',
+            'createdAt',
+            'updatedAt',
+            'createdByUid',
+            'updatedByUid'
+          ])
+          && data.keys().hasOnly([
+            'id',
+            'publicationFormat',
+            'title',
+            'year',
+            'month',
+            'periodIndex',
+            'periodStart',
+            'periodEnd',
+            'reportingPeriodLabel',
+            'publicationDate',
+            'evidenceCutoffDate',
+            'assessmentDate',
+            'evidenceCutoffTimeWat',
+            'evidenceCutoffDateTimeWat',
+            'publishedAt',
+            'isQuietDay',
+            'carriedForwardAllStates',
+            'carriedForwardFromPublicationId',
+            'supersedesPublicationId',
+            'revisionNumber',
+            'approvalRecord',
+            'methodologyVersion',
+            'revisionNote',
+            'status',
+            'isLatest',
+            'isBaseline',
+            'summary',
+            'changesSummary',
+            'supportingDocumentUrl',
+            'classifications',
+            'createdAt',
+            'updatedAt',
+            'createdByUid',
+            'updatedByUid'
+          ])
+          && data.publicationFormat == 'daily'
+          && data.title is string && data.title.size() >= 3 && data.title.size() <= 240
+          && data.year is int && data.year >= 2020 && data.year <= 2100
+          && data.month is int && data.month >= 1 && data.month <= 12
+          && data.periodIndex is int && data.periodIndex >= 1 && data.periodIndex <= 31
+          && data.assessmentDate is string && data.assessmentDate.matches('^\\d{4}-\\d{2}-\\d{2}$')
+          && data.evidenceCutoffTimeWat is string && data.evidenceCutoffTimeWat.matches('^([01]\\d|2[0-3]):[0-5]\\d$')
+          && data.evidenceCutoffDateTimeWat is string && data.evidenceCutoffDateTimeWat.matches('^\\d{4}-\\d{2}-\\d{2}T([01]\\d|2[0-3]):[0-5]\\d:00\\+01:00$')
+          && data.reportingPeriodLabel is string && data.reportingPeriodLabel.size() <= 120
+          && data.publicationDate is string && data.publicationDate.size() <= 80
+          && data.evidenceCutoffDate is string && data.evidenceCutoffDate.size() <= 120
+          && data.methodologyVersion is string && data.methodologyVersion.size() <= 64
+          && data.status in ['draft', 'approved', 'published']
+          && data.isLatest is bool
+          && data.summary is string && data.summary.size() <= 10000
+          && data.classifications is map && data.classifications.size() == 37
+          && data.createdAt is int && data.updatedAt is int
+          && data.createdByUid is string && data.createdByUid.size() <= 128
+          && data.updatedByUid is string && data.updatedByUid.size() <= 128
+          && (!('supersedesPublicationId' in data) || (data.supersedesPublicationId is string && data.supersedesPublicationId.size() >= 3 && data.supersedesPublicationId.size() <= 128))
+          && (!('revisionNumber' in data) || (data.revisionNumber is int && data.revisionNumber >= 1 && data.revisionNumber <= 999))
+          // Require documented Research approval reference + admin recorder identity & non-empty summary for approved or published status
+          && (
+            data.status == 'draft' ||
+            (
+              data.summary.size() >= 10 &&
+              'approvalRecord' in data &&
+              isValidDcmDailyApproval(data.approvalRecord)
+            )
+          )
+          // Require actual publication timestamp when status is published
+          && (
+            data.status != 'published' ||
+            ('publishedAt' in data && data.publishedAt is string && data.publishedAt.size() >= 10 && data.publishedAt.size() <= 64)
+          );
+    }
+
+    // Stage 3 validators for scalable Public Evidence, Incident History & Private Notes
+    function isSafeExternalUrl(url) {
+      return url is string && url.size() <= 2048 && url.matches('^https?://[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}.*$');
+    }
+
+    function isValidDcmEvidence(data) {
+      return data.keys().hasAll([
+            'id',
+            'stateCode',
+            'stateName',
+            'linkedPublicationIds',
+            'title',
+            'publicDescription',
+            'sourceName',
+            'sourcePublicationDate',
+            'verificationStatus',
+            'isDisputed',
+            'visibility',
+            'status',
+            'createdAt',
+            'updatedAt',
+            'createdByUid',
+            'updatedByUid'
+          ])
+          && data.keys().hasOnly([
+            'id',
+            'stateCode',
+            'stateName',
+            'incidentId',
+            'linkedPublicationIds',
+            'title',
+            'publicDescription',
+            'sourceName',
+            'sourcePublicationDate',
+            'sourceUrl',
+            'documentReference',
+            'verificationStatus',
+            'isDisputed',
+            'disputedClaimNote',
+            'institutionalResponse',
+            'visibility',
+            'status',
+            'approvalRecord',
+            'supersedesEvidenceId',
+            'revisionNumber',
+            'publishedAt',
+            'createdAt',
+            'updatedAt',
+            'createdByUid',
+            'updatedByUid'
+          ])
+          && data.stateCode is string && data.stateCode.size() == 2
+          && data.stateName is string && data.stateName.size() >= 2 && data.stateName.size() <= 64
+          && data.linkedPublicationIds is list && data.linkedPublicationIds.size() <= 200
+          && data.title is string && data.title.size() >= 3 && data.title.size() <= 240
+          && data.publicDescription is string && data.publicDescription.size() >= 10 && data.publicDescription.size() <= 5000
+          && data.sourceName is string && data.sourceName.size() >= 2 && data.sourceName.size() <= 200
+          && data.sourcePublicationDate is string && data.sourcePublicationDate.matches('^\\d{4}-\\d{2}-\\d{2}$')
+          && (!('sourceUrl' in data) || data.sourceUrl == '' || isSafeExternalUrl(data.sourceUrl))
+          && (!('documentReference' in data) || (data.documentReference is string && data.documentReference.size() <= 500))
+          && (!('incidentId' in data) || (data.incidentId is string && data.incidentId.size() <= 128))
+          && data.verificationStatus in [
+            'Verified by Research',
+            'Corroborated (Multiple Sources)',
+            'Official Document / Public Record',
+            'Disputed — Under Research Review',
+            'Unverified Lead (Private)'
+          ]
+          && data.isDisputed is bool
+          && (!('disputedClaimNote' in data) || (data.disputedClaimNote is string && data.disputedClaimNote.size() <= 2000))
+          && (!('institutionalResponse' in data) || data.institutionalResponse is map)
+          && data.visibility in ['public', 'private']
+          && data.status in ['draft', 'approved', 'published']
+          && data.createdAt is int && data.updatedAt is int
+          && data.createdByUid is string && data.createdByUid.size() <= 128
+          && data.updatedByUid is string && data.updatedByUid.size() <= 128
+          && (!('supersedesEvidenceId' in data) || (data.supersedesEvidenceId is string && data.supersedesEvidenceId.size() >= 3 && data.supersedesEvidenceId.size() <= 128))
+          && (!('revisionNumber' in data) || (data.revisionNumber is int && data.revisionNumber >= 1 && data.revisionNumber <= 999))
+          // Privacy safeguard: unverified leads can NEVER be marked public, approved, or published
+          && (
+            data.verificationStatus != 'Unverified Lead (Private)' ||
+            (data.visibility == 'private' && data.status == 'draft')
+          )
+          // Approval gate: approved/published evidence requires documented Research approval reference + admin recorder identity
+          && (
+            data.status == 'draft' ||
+            ('approvalRecord' in data && isValidDcmDailyApproval(data.approvalRecord))
+          )
+          && (
+            data.status != 'published' ||
+            ('publishedAt' in data && data.publishedAt is string && data.publishedAt.size() >= 10 && data.publishedAt.size() <= 64)
+          );
+    }
+
+    function isValidDcmIncident(data) {
+      return data.keys().hasAll([
+            'id',
+            'stateCode',
+            'stateName',
+            'title',
+            'summary',
+            'researchStatusLabel',
+            'firstReportedDate',
+            'linkedPublicationIds',
+            'visibility',
+            'status',
+            'createdAt',
+            'updatedAt',
+            'createdByUid',
+            'updatedByUid'
+          ])
+          && data.keys().hasOnly([
+            'id',
+            'stateCode',
+            'stateName',
+            'title',
+            'summary',
+            'researchStatusLabel',
+            'firstReportedDate',
+            'linkedPublicationIds',
+            'visibility',
+            'status',
+            'approvalRecord',
+            'supersedesIncidentId',
+            'revisionNumber',
+            'publishedAt',
+            'createdAt',
+            'updatedAt',
+            'createdByUid',
+            'updatedByUid'
+          ])
+          && data.stateCode is string && data.stateCode.size() == 2
+          && data.stateName is string && data.stateName.size() >= 2 && data.stateName.size() <= 64
+          && data.title is string && data.title.size() >= 3 && data.title.size() <= 240
+          && data.summary is string && data.summary.size() >= 10 && data.summary.size() <= 5000
+          && data.researchStatusLabel is string && data.researchStatusLabel.size() >= 2 && data.researchStatusLabel.size() <= 120
+          && data.firstReportedDate is string && data.firstReportedDate.matches('^\\d{4}-\\d{2}-\\d{2}$')
+          && data.linkedPublicationIds is list && data.linkedPublicationIds.size() <= 200
+          && data.visibility in ['public', 'private']
+          && data.status in ['draft', 'approved', 'published']
+          && data.createdAt is int && data.updatedAt is int
+          && data.createdByUid is string && data.createdByUid.size() <= 128
+          && data.updatedByUid is string && data.updatedByUid.size() <= 128
+          && (!('supersedesIncidentId' in data) || (data.supersedesIncidentId is string && data.supersedesIncidentId.size() >= 3 && data.supersedesIncidentId.size() <= 128))
+          && (!('revisionNumber' in data) || (data.revisionNumber is int && data.revisionNumber >= 1 && data.revisionNumber <= 999))
+          && (
+            data.status == 'draft' ||
+            ('approvalRecord' in data && isValidDcmDailyApproval(data.approvalRecord))
+          )
+          && (
+            data.status != 'published' ||
+            ('publishedAt' in data && data.publishedAt is string && data.publishedAt.size() >= 10 && data.publishedAt.size() <= 64)
+          );
+    }
+
+    function isValidDcmIncidentDevelopment(data) {
+      return data.keys().hasAll([
+            'id',
+            'incidentId',
+            'stateCode',
+            'developmentDate',
+            'title',
+            'approvedDescription',
+            'researchStatusLabel',
+            'sourceReferences',
+            'visibility',
+            'status',
+            'createdAt',
+            'updatedAt',
+            'createdByUid',
+            'updatedByUid'
+          ])
+          && data.keys().hasOnly([
+            'id',
+            'incidentId',
+            'stateCode',
+            'developmentDate',
+            'title',
+            'approvedDescription',
+            'researchStatusLabel',
+            'isRemedyOrFollowUp',
+            'sourceReferences',
+            'linkedEvidenceIds',
+            'linkedPublicationIds',
+            'visibility',
+            'status',
+            'approvalRecord',
+            'supersedesDevelopmentId',
+            'revisionNumber',
+            'publishedAt',
+            'createdAt',
+            'updatedAt',
+            'createdByUid',
+            'updatedByUid'
+          ])
+          && data.incidentId is string && data.incidentId.size() >= 3 && data.incidentId.size() <= 128
+          && data.stateCode is string && data.stateCode.size() == 2
+          && data.developmentDate is string && data.developmentDate.matches('^\\d{4}-\\d{2}-\\d{2}$')
+          && data.title is string && data.title.size() >= 3 && data.title.size() <= 240
+          && data.approvedDescription is string && data.approvedDescription.size() >= 10 && data.approvedDescription.size() <= 5000
+          && data.researchStatusLabel is string && data.researchStatusLabel.size() >= 2 && data.researchStatusLabel.size() <= 120
+          && (!('isRemedyOrFollowUp' in data) || data.isRemedyOrFollowUp is bool)
+          && data.sourceReferences is list && data.sourceReferences.size() <= 25
+          && (!('linkedEvidenceIds' in data) || (data.linkedEvidenceIds is list && data.linkedEvidenceIds.size() <= 50))
+          && (!('linkedPublicationIds' in data) || (data.linkedPublicationIds is list && data.linkedPublicationIds.size() <= 200))
+          && data.visibility in ['public', 'private']
+          && data.status in ['draft', 'approved', 'published']
+          && data.createdAt is int && data.updatedAt is int
+          && data.createdByUid is string && data.createdByUid.size() <= 128
+          && data.updatedByUid is string && data.updatedByUid.size() <= 128
+          && (!('supersedesDevelopmentId' in data) || (data.supersedesDevelopmentId is string && data.supersedesDevelopmentId.size() >= 3 && data.supersedesDevelopmentId.size() <= 128))
+          && (!('revisionNumber' in data) || (data.revisionNumber is int && data.revisionNumber >= 1 && data.revisionNumber <= 999))
+          && (
+            data.status == 'draft' ||
+            ('approvalRecord' in data && isValidDcmDailyApproval(data.approvalRecord))
+          )
+          && (
+            data.status != 'published' ||
+            (data.sourceReferences.size() >= 1 && 'publishedAt' in data && data.publishedAt is string && data.publishedAt.size() >= 10 && data.publishedAt.size() <= 64)
+          );
+    }
+
+    function isValidDcmPrivateNote(data) {
+      return data.keys().hasAll([
+            'id',
+            'targetType',
+            'targetId',
+            'stateCode',
+            'confidentialNotes',
+            'createdAt',
+            'updatedAt',
+            'createdByUid',
+            'updatedByUid'
+          ])
+          && data.keys().hasOnly([
+            'id',
+            'targetType',
+            'targetId',
+            'stateCode',
+            'confidentialNotes',
+            'confidentialContacts',
+            'unverifiedLeads',
+            'createdAt',
+            'updatedAt',
+            'createdByUid',
+            'updatedByUid'
+          ])
+          && data.targetType in ['evidence', 'incident', 'development', 'state-assessment']
+          && data.targetId is string && data.targetId.size() >= 3 && data.targetId.size() <= 128
+          && data.stateCode is string && data.stateCode.size() == 2
+          && data.confidentialNotes is string && data.confidentialNotes.size() <= 10000
+          && (!('confidentialContacts' in data) || (data.confidentialContacts is string && data.confidentialContacts.size() <= 5000))
+          && (!('unverifiedLeads' in data) || (data.unverifiedLeads is string && data.unverifiedLeads.size() <= 10000))
+          && data.createdAt is int && data.updatedAt is int
+          && data.createdByUid is string && data.createdByUid.size() <= 128
+          && data.updatedByUid is string && data.updatedByUid.size() <= 128;
+    }
+
+    function isValidDcmEditorialHandover(data) {
+      return data.keys().hasAll([
+            'id',
+            'publicationId',
+            'publicationAssessmentDate',
+            'stateCode',
+            'stateName',
+            'exportType',
+            'preparedByUid',
+            'preparedByName',
+            'exportedAtIso',
+            'exportedAtWatLabel',
+            'handoverStatus',
+            'permanentRecordUrl',
+            'sourceApprovalReference',
+            'governanceNotice',
+            'hasEditorialDraftEdits',
+            'snapshotPayload',
+            'createdAt',
+            'updatedAt',
+            'createdByUid',
+            'updatedByUid'
+          ])
+          && data.keys().hasOnly([
+            'id',
+            'publicationId',
+            'publicationAssessmentDate',
+            'stateCode',
+            'stateName',
+            'incidentId',
+            'exportType',
+            'preparedByUid',
+            'preparedByName',
+            'preparedByEmail',
+            'exportedAtIso',
+            'exportedAtWatLabel',
+            'handoverStatus',
+            'recipientTeam',
+            'permanentRecordUrl',
+            'sourceApprovalReference',
+            'governanceNotice',
+            'hasEditorialDraftEdits',
+            'snapshotPayload',
+            'createdAt',
+            'updatedAt',
+            'createdByUid',
+            'updatedByUid'
+          ])
+          && data.publicationId is string && data.publicationId.size() >= 3 && data.publicationId.size() <= 128
+          && data.publicationAssessmentDate is string && data.publicationAssessmentDate.matches('^\\d{4}-\\d{2}-\\d{2}$')
+          && data.stateCode is string && data.stateCode.size() == 2
+          && data.stateName is string && data.stateName.size() >= 2 && data.stateName.size() <= 64
+          && (!('incidentId' in data) || (data.incidentId is string && data.incidentId.size() >= 3 && data.incidentId.size() <= 128))
+          && data.exportType in ['website-summary', 'newsletter-dcw', 'clearpath-on-the-map']
+          && data.preparedByUid is string && data.preparedByUid.size() >= 1 && data.preparedByUid.size() <= 128
+          && data.preparedByName is string && data.preparedByName.size() >= 2 && data.preparedByName.size() <= 120
+          && (!('preparedByEmail' in data) || (data.preparedByEmail is string && data.preparedByEmail.size() <= 160))
+          && data.exportedAtIso is string && data.exportedAtIso.size() >= 10 && data.exportedAtIso.size() <= 64
+          && data.exportedAtWatLabel is string && data.exportedAtWatLabel.size() >= 6 && data.exportedAtWatLabel.size() <= 120
+          && data.handoverStatus in ['prepared', 'handed-over', 'published-externally', 'archived']
+          && (!('recipientTeam' in data) || (data.recipientTeam is string && data.recipientTeam.size() <= 160))
+          && data.permanentRecordUrl is string && data.permanentRecordUrl.size() >= 10 && data.permanentRecordUrl.size() <= 2048
+          && data.sourceApprovalReference is string && data.sourceApprovalReference.size() >= 3 && data.sourceApprovalReference.size() <= 160
+          && data.governanceNotice is string && data.governanceNotice.size() >= 10 && data.governanceNotice.size() <= 400
+          && data.hasEditorialDraftEdits is bool
+          && data.snapshotPayload is string && data.snapshotPayload.size() >= 2 && data.snapshotPayload.size() <= 40000
+          && data.createdAt is int && data.updatedAt is int
+          && data.createdByUid is string && data.createdByUid.size() <= 128
+          && data.updatedByUid is string && data.updatedByUid.size() <= 128;
+    }
+
+    // Connection health check document
+    match /test/{docId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // Scalable Daily DCM Publications collection (one document per daily update)
+    match /dcm_daily_publications/{publicationId} {
+      // Public visitors may read ONLY published daily editions; authorised admins may read drafts/approved/published or check non-existent IDs
+      allow get: if isValidId(publicationId) && (isAuthorizedAdmin() || (resource != null && existing().status == 'published'));
+      allow list: if isAuthorizedAdmin() || resource.data.status == 'published';
+
+      // Only authorised admins may create daily records
+      allow create: if isAuthorizedAdmin()
+                    && isValidId(publicationId)
+                    && isValidDcmDailyPublication(incoming())
+                    && incoming().id == publicationId
+                    && incoming().createdByUid == request.auth.uid
+                    && incoming().updatedByUid == request.auth.uid;
+
+      // Only authorised admins may update non-published records; published records are immutable
+      allow update: if isAuthorizedAdmin()
+                    && isValidId(publicationId)
+                    && existing().status != 'published'
+                    && isValidDcmDailyPublication(incoming())
+                    && incoming().id == existing().id
+                    && incoming().createdAt == existing().createdAt
+                    && incoming().createdByUid == existing().createdByUid
+                    && incoming().updatedByUid == request.auth.uid;
+
+      // Only authorised admins may delete non-published drafts/approved records; published editions cannot be deleted
+      allow delete: if isAuthorizedAdmin()
+                    && isValidId(publicationId)
+                    && existing().status != 'published';
+    }
+
+    // Stage 3: Public Evidence Records (strictly published + visibility == 'public' readable by visitors; immutable once published)
+    // Note: isValidDcmEvidence guarantees at write-time that 'Unverified Lead (Private)' can ONLY exist with visibility == 'private' && status == 'draft'.
+    // Aligning allow list with (status == 'published' && visibility == 'public') ensures indexed public queries pass Firestore's static rules-are-not-filters check.
+    match /dcm_evidence/{evidenceId} {
+      allow get: if isValidId(evidenceId) && (
+        isAuthorizedAdmin() ||
+        (resource != null && existing().status == 'published' && existing().visibility == 'public' && existing().verificationStatus != 'Unverified Lead (Private)')
+      );
+      allow list: if isAuthorizedAdmin() || (
+        resource.data.status == 'published' &&
+        resource.data.visibility == 'public'
+      );
+
+      allow create: if isAuthorizedAdmin()
+                    && isValidId(evidenceId)
+                    && isValidDcmEvidence(incoming())
+                    && incoming().id == evidenceId
+                    && incoming().createdByUid == request.auth.uid
+                    && incoming().updatedByUid == request.auth.uid;
+
+      allow update: if isAuthorizedAdmin()
+                    && isValidId(evidenceId)
+                    && existing().status != 'published'
+                    && isValidDcmEvidence(incoming())
+                    && incoming().id == existing().id
+                    && incoming().createdAt == existing().createdAt
+                    && incoming().createdByUid == existing().createdByUid
+                    && incoming().updatedByUid == request.auth.uid;
+
+      allow delete: if isAuthorizedAdmin()
+                    && isValidId(evidenceId)
+                    && existing().status != 'published';
+    }
+
+    // Stage 3: Incident Records (parent records grouping multiple chronological developments; immutable once published)
+    match /dcm_incidents/{incidentId} {
+      allow get: if isValidId(incidentId) && (
+        isAuthorizedAdmin() ||
+        (resource != null && existing().status == 'published' && existing().visibility == 'public')
+      );
+      allow list: if isAuthorizedAdmin() || (
+        resource.data.status == 'published' &&
+        resource.data.visibility == 'public'
+      );
+
+      allow create: if isAuthorizedAdmin()
+                    && isValidId(incidentId)
+                    && isValidDcmIncident(incoming())
+                    && incoming().id == incidentId
+                    && incoming().createdByUid == request.auth.uid
+                    && incoming().updatedByUid == request.auth.uid;
+
+      allow update: if isAuthorizedAdmin()
+                    && isValidId(incidentId)
+                    && existing().status != 'published'
+                    && isValidDcmIncident(incoming())
+                    && incoming().id == existing().id
+                    && incoming().createdAt == existing().createdAt
+                    && incoming().createdByUid == existing().createdByUid
+                    && incoming().updatedByUid == request.auth.uid;
+
+      allow delete: if isAuthorizedAdmin()
+                    && isValidId(incidentId)
+                    && existing().status != 'published';
+    }
+
+    // Stage 3: Incident Developments (dated developments associated with a parent incidentId; immutable once published)
+    match /dcm_incident_developments/{developmentId} {
+      allow get: if isValidId(developmentId) && (
+        isAuthorizedAdmin() ||
+        (resource != null && existing().status == 'published' && existing().visibility == 'public')
+      );
+      allow list: if isAuthorizedAdmin() || (
+        resource.data.status == 'published' &&
+        resource.data.visibility == 'public'
+      );
+
+      allow create: if isAuthorizedAdmin()
+                    && isValidId(developmentId)
+                    && isValidDcmIncidentDevelopment(incoming())
+                    && incoming().id == developmentId
+                    && incoming().createdByUid == request.auth.uid
+                    && incoming().updatedByUid == request.auth.uid;
+
+      allow update: if isAuthorizedAdmin()
+                    && isValidId(developmentId)
+                    && existing().status != 'published'
+                    && isValidDcmIncidentDevelopment(incoming())
+                    && incoming().id == existing().id
+                    && incoming().createdAt == existing().createdAt
+                    && incoming().createdByUid == existing().createdByUid
+                    && incoming().updatedByUid == request.auth.uid;
+
+      allow delete: if isAuthorizedAdmin()
+                    && isValidId(developmentId)
+                    && existing().status != 'published';
+    }
+
+    // Stage 3: Confidential / Private Notes (strictly admin-only isolation for internal notes, contacts & unverified leads)
+    match /dcm_private_notes/{noteId} {
+      allow get, list: if isAuthorizedAdmin();
+      allow create: if isAuthorizedAdmin()
+                    && isValidId(noteId)
+                    && isValidDcmPrivateNote(incoming())
+                    && incoming().id == noteId
+                    && incoming().createdByUid == request.auth.uid
+                    && incoming().updatedByUid == request.auth.uid;
+      allow update: if isAuthorizedAdmin()
+                    && isValidId(noteId)
+                    && isValidDcmPrivateNote(incoming())
+                    && incoming().id == existing().id
+                    && incoming().createdAt == existing().createdAt
+                    && incoming().createdByUid == existing().createdByUid
+                    && incoming().updatedByUid == request.auth.uid;
+      allow delete: if isAuthorizedAdmin() && isValidId(noteId);
+    }
+
+    // Stage 6: Editorial Handover Records (admin-only audit log for Newsletter & ClearPath extracts; immutable source snapshot)
+    match /dcm_editorial_handovers/{handoverId} {
+      allow get, list: if isAuthorizedAdmin();
+
+      allow create: if isAuthorizedAdmin()
+                    && isValidId(handoverId)
+                    && isValidDcmEditorialHandover(incoming())
+                    && incoming().id == handoverId
+                    && incoming().preparedByUid == request.auth.uid
+                    && incoming().createdByUid == request.auth.uid
+                    && incoming().updatedByUid == request.auth.uid;
+
+      // Handover status and recipientTeam may be updated by authorised admins, while immutable source snapshot and lineage fields remain locked
+      allow update: if isAuthorizedAdmin()
+                    && isValidId(handoverId)
+                    && isValidDcmEditorialHandover(incoming())
+                    && incoming().id == existing().id
+                    && incoming().publicationId == existing().publicationId
+                    && incoming().publicationAssessmentDate == existing().publicationAssessmentDate
+                    && incoming().stateCode == existing().stateCode
+                    && incoming().stateName == existing().stateName
+                    && incoming().exportType == existing().exportType
+                    && incoming().preparedByUid == existing().preparedByUid
+                    && incoming().exportedAtIso == existing().exportedAtIso
+                    && incoming().permanentRecordUrl == existing().permanentRecordUrl
+                    && incoming().sourceApprovalReference == existing().sourceApprovalReference
+                    && incoming().governanceNotice == existing().governanceNotice
+                    && incoming().hasEditorialDraftEdits == existing().hasEditorialDraftEdits
+                    && incoming().snapshotPayload == existing().snapshotPayload
+                    && incoming().createdAt == existing().createdAt
+                    && incoming().createdByUid == existing().createdByUid
+                    && incoming().updatedByUid == request.auth.uid;
+
+      // Never delete editorial handover audit records (mark handoverStatus = 'archived' instead)
+      allow delete: if false;
     }
 
     // Subscribers collection matching
     match /subscribers/{subscriberId} {
       // Allow any visitor to subscribe
       allow create: if isValidId(subscriberId) && isValidSubscriber(incoming());
-      
+
       // Allow read and deletion only to signed-in admins
       allow read, delete: if isSignedIn();
     }
 
-    // CMS documents collection matching (for site content, uploads, hero, stats, reports, logos, states)
-    match /cms/{document=**} {
-      allow read: if true;
-      allow write: if true;
+    // DCM Brief requests log
+    match /dcm_brief_requests/{requestId} {
+      allow create: if true;
+      allow read, delete: if isAuthorizedAdmin();
+    }
+
+    // CMS documents collection matching (preserves existing collections while isolating legacy DCM drafts)
+    // CRITICAL: /cms/dcm_publications contains unpublished legacy drafts (e.g. dcm-2026-11-end) and MUST be admin-only.
+    // Public visitors read strictly published-only legacy records from /cms/dcm_publications_public.
+    match /cms/{docId} {
+      allow read: if docId == 'dcm_publications' ? isAuthorizedAdmin() : true;
+      allow write: if (docId == 'dcm_publications' || docId == 'dcm_publications_public') ? isAuthorizedAdmin() : true;
     }
 
     // Publications and reports collections

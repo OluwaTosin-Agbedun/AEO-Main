@@ -3,9 +3,11 @@ import {
   Award, Plus, Trash2, Edit3, CheckCircle2, AlertCircle, 
   Download, UploadCloud, Eye, Save, X, RotateCcw, 
   Check, Filter, ShieldCheck, Sparkles, Layers, FileSpreadsheet,
-  AlertTriangle, Calendar, Info
+  AlertTriangle, Calendar, Info, Clock, Lock, Copy, FileCheck2, Send,
+  FileText, GitBranch, Newspaper
 } from 'lucide-react';
 import { useCMS } from '../context/CMSContext';
+import { auth } from '../lib/firebase';
 import { 
   DcmPublication, 
   DcmClassification, 
@@ -21,34 +23,57 @@ import {
 } from '../types/dcm';
 import { DcmMap } from './DcmMap';
 import { INITIAL_DCM_PUBLICATIONS } from '../data/dcmInitialData';
+import { getLatestDcmPublication, getPublishedDcmSorted } from '../utils/dcmComparison';
+import {
+  WAT_LABEL,
+  buildDailyPublicationId,
+  carryForwardClassifications,
+  createBlank37Classifications,
+  createCorrectionDraft,
+  createDailyDraft,
+  diffClassificationsAgainstSource,
+  formatDailyDateLabel,
+  formatTimestampInWat,
+  formatWatCutoff,
+  isDailyPublication,
+  parseIsoDate,
+  validateDailyPublication,
+  validateLegacyPublication
+} from '../utils/dcmDaily';
+import { auditPublicationConsistency } from '../utils/dcmConsistency';
+import { DcmEvidenceCmsManager } from './DcmEvidenceCmsManager';
+import { DcmEditorialPublishingManager } from './DcmEditorialPublishingManager';
 
 function createBlank37Jurisdictions(): Record<string, DcmStateRecord> {
-  const result: Record<string, DcmStateRecord> = {};
-  for (const j of NIGERIA_37_JURISDICTIONS) {
-    result[j.code] = {
-      stateCode: j.code,
-      stateName: j.name,
-      classification: 'Insufficient evidence',
-      direction: 'insufficient-basis',
-      confidence: 'Low',
-      keyFinding: '',
-      classificationRationale: '',
-      evidenceSummary: '',
-      rightOfResponseStatus: 'Not required'
-    };
-  }
-  return result;
+  return createBlank37Classifications();
 }
 
 export const DcmCmsManager: React.FC = () => {
-  const { dcmPublications, saveDcmPublication, deleteDcmPublication } = useCMS();
+  const {
+    dcmPublications,
+    saveDcmPublication,
+    deleteDcmPublication,
+    saveDailyDcmPublication,
+    deleteDailyDcmPublication,
+    dcmEvidence,
+    dcmIncidents,
+    dcmEditorialHandovers
+  } = useCMS();
 
   const publications = useMemo(() => {
     if (dcmPublications && dcmPublications.length > 0) return dcmPublications;
     return INITIAL_DCM_PUBLICATIONS;
   }, [dcmPublications]);
 
+  const publishedSourceOptions = useMemo(() => {
+    // Newest published editions first (both legacy and daily) for carry-forward selection
+    return [...getPublishedDcmSorted(publications)].reverse();
+  }, [publications]);
+
+  const [dcmSectionTab, setDcmSectionTab] = useState<'publications' | 'evidence' | 'incidents' | 'editorial'>('publications');
+  const [formatFilter, setFormatFilter] = useState<'all' | 'daily' | 'legacy'>('all');
   const [editingPub, setEditingPub] = useState<Partial<DcmPublication> | null>(null);
+  const [editingExistingId, setEditingExistingId] = useState<string | null>(null);
   const [classifications, setClassifications] = useState<Record<string, DcmStateRecord>>({});
   const [searchState, setSearchState] = useState('');
   const [zoneFilter, setZoneFilter] = useState<string>('all');
@@ -57,16 +82,129 @@ export const DcmCmsManager: React.FC = () => {
   const [previewSelectedCode, setPreviewSelectedCode] = useState<string | null>(null);
   const [statusMsg, setStatusMsg] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
   const [validationErrors, setValidationErrors] = useState<string[]>([]);
+  const [isSaving, setIsSaving] = useState<boolean>(false);
+  const [approverName, setApproverName] = useState<string>('');
+  const [approvalReference, setApprovalReference] = useState<string>('');
+  const [approvalConfirmed, setApprovalConfirmed] = useState<boolean>(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mainListFileInputRef = useRef<HTMLInputElement>(null);
   const [showCsvGuide, setShowCsvGuide] = useState<boolean>(false);
 
+  const isEditingDaily = isDailyPublication(editingPub);
+  const existingRecord = useMemo(() => {
+    if (!editingExistingId) return null;
+    return publications.find((p) => p.id === editingExistingId) || null;
+  }, [editingExistingId, publications]);
+
+  const isReadOnlyPublishedDaily = Boolean(
+    existingRecord && existingRecord.status === 'published'
+  );
+
+  const carryForwardSourcePub = useMemo(() => {
+    if (!editingPub?.carriedForwardFromPublicationId) return null;
+    return publications.find((p) => p.id === editingPub.carriedForwardFromPublicationId) || null;
+  }, [editingPub?.carriedForwardFromPublicationId, publications]);
+
+  const dailyDiff = useMemo(() => {
+    if (!isEditingDaily) return null;
+    return diffClassificationsAgainstSource(classifications, carryForwardSourcePub);
+  }, [isEditingDaily, classifications, carryForwardSourcePub]);
+
+  const liveConsistencyAudit = useMemo(() => {
+    if (!editingPub) return null;
+    const candidate: DcmPublication = {
+      id: editingPub.id || 'draft-preview',
+      publicationFormat: isEditingDaily ? 'daily' : 'legacy-period',
+      title: editingPub.title || '',
+      year: Number(editingPub.year) || 2026,
+      month: Number(editingPub.month) || 1,
+      periodIndex: Number(editingPub.periodIndex) || 1,
+      periodStart: editingPub.assessmentDate || editingPub.periodStart || '',
+      periodEnd: editingPub.assessmentDate || editingPub.periodEnd || '',
+      reportingPeriodLabel: editingPub.reportingPeriodLabel || '',
+      publicationDate: editingPub.publicationDate || '',
+      evidenceCutoffDate: editingPub.evidenceCutoffDate || '',
+      assessmentDate: editingPub.assessmentDate,
+      evidenceCutoffTimeWat: editingPub.evidenceCutoffTimeWat,
+      evidenceCutoffDateTimeWat: editingPub.evidenceCutoffDateTimeWat,
+      isQuietDay: Boolean(editingPub.isQuietDay),
+      carriedForwardAllStates: Boolean(editingPub.carriedForwardAllStates),
+      carriedForwardFromPublicationId: editingPub.carriedForwardFromPublicationId,
+      methodologyVersion: editingPub.methodologyVersion || 'Version 1.1',
+      status: (editingPub.status as any) || 'draft',
+      isLatest: Boolean(editingPub.isLatest),
+      summary: editingPub.summary || '',
+      classifications,
+      createdAt: editingPub.createdAt || 0,
+      updatedAt: editingPub.updatedAt || 0
+    };
+    return auditPublicationConsistency(candidate, carryForwardSourcePub);
+  }, [editingPub, isEditingDaily, classifications, carryForwardSourcePub]);
+
+  const dailyWatPreview = useMemo(() => {
+    if (!isEditingDaily) return null;
+    return formatWatCutoff(
+      editingPub?.assessmentDate || '',
+      editingPub?.evidenceCutoffTimeWat || ''
+    );
+  }, [isEditingDaily, editingPub?.assessmentDate, editingPub?.evidenceCutoffTimeWat]);
+
+  const filteredPublicationsList = useMemo(() => {
+    return publications.filter((pub) => {
+      const daily = isDailyPublication(pub);
+      if (formatFilter === 'daily') return daily;
+      if (formatFilter === 'legacy') return !daily;
+      return true;
+    });
+  }, [publications, formatFilter]);
+
+  const dailyCount = useMemo(
+    () => publications.filter((p) => isDailyPublication(p)).length,
+    [publications]
+  );
+  const legacyCount = publications.length - dailyCount;
+
   const showStatus = (text: string, type: 'success' | 'error' = 'success') => {
     setStatusMsg({ text, type });
-    setTimeout(() => setStatusMsg(null), 5000);
+    setTimeout(() => setStatusMsg(null), 6000);
   };
 
-  // Start new publication
+  // Start new DAILY DCM publication (carries forward all 37 previously approved classifications verbatim)
+  const handleStartNewDaily = (opts?: { isQuietDay?: boolean; sourcePub?: DcmPublication | null }) => {
+    const todayIso = new Date().toISOString().slice(0, 10);
+    const sourcePub =
+      opts?.sourcePub !== undefined
+        ? opts.sourcePub
+        : getLatestDcmPublication(publications) || publishedSourceOptions[0] || null;
+
+    const draft = createDailyDraft({
+      assessmentDate: todayIso,
+      cutoffTimeWat: '17:00',
+      sourcePub,
+      existingIds: publications.map((p) => p.id),
+      isQuietDay: Boolean(opts?.isQuietDay),
+      createdByUid: auth.currentUser?.uid
+    });
+
+    setEditingPub(draft);
+    setEditingExistingId(null);
+    setClassifications(draft.classifications);
+    setApproverName('');
+    setApprovalReference('');
+    setApprovalConfirmed(false);
+    setValidationErrors([]);
+    setShowLivePreview(false);
+
+    if (sourcePub) {
+      showStatus(
+        opts?.isQuietDay
+          ? `Quiet-day daily draft initialized from "${sourcePub.reportingPeriodLabel}". All 37 approved classifications are retained without change. Enter the Research-approved quiet-day statement and WAT cut-off time.`
+          : `Daily draft initialized from "${sourcePub.reportingPeriodLabel}". All 37 approved classifications have been carried forward unchanged.`
+      );
+    }
+  };
+
+  // Start new legacy reporting-period publication
   const handleStartNew = () => {
     const now = new Date();
     const curYear = now.getFullYear();
@@ -80,6 +218,7 @@ export const DcmCmsManager: React.FC = () => {
 
     setEditingPub({
       id: newId,
+      publicationFormat: 'legacy-period',
       title: `Democratic Competitiveness Map: ${periodLabel}`,
       year: curYear,
       month: curMonth,
@@ -92,20 +231,45 @@ export const DcmCmsManager: React.FC = () => {
       methodologyVersion: 'Version 1.1',
       revisionNote: '',
       status: 'draft',
-      isLatest: true,
+      isLatest: false,
       summary: '',
       changesSummary: '',
       supportingDocumentUrl: ''
     });
 
+    setEditingExistingId(null);
     setClassifications(createBlank37Jurisdictions());
+    setApproverName('');
+    setApprovalReference('');
+    setApprovalConfirmed(false);
     setValidationErrors([]);
     setShowLivePreview(false);
   };
 
-  // Start editing existing publication
+  // Issue a new versioned correction draft for a published edition (preserves previous published version intact)
+  const handleCreateCorrectionRevision = (publishedPub: DcmPublication) => {
+    const draft = createCorrectionDraft(
+      publishedPub,
+      publications.map((p) => p.id),
+      auth.currentUser?.uid
+    );
+    setEditingPub(draft);
+    setEditingExistingId(null);
+    setClassifications(draft.classifications);
+    setApproverName('');
+    setApprovalReference('');
+    setApprovalConfirmed(false);
+    setValidationErrors([]);
+    setShowLivePreview(false);
+    showStatus(
+      `Created corrected revision draft "${draft.id}" superseding "${publishedPub.id}". The previously published edition remains preserved and unchanged.`
+    );
+  };
+
+  // Start editing or viewing existing publication
   const handleEdit = (pub: DcmPublication) => {
     setEditingPub({ ...pub });
+    setEditingExistingId(pub.id);
     const map = { ...createBlank37Jurisdictions() };
     if (pub.classifications) {
       for (const [code, rec] of Object.entries(pub.classifications)) {
@@ -115,6 +279,9 @@ export const DcmCmsManager: React.FC = () => {
       }
     }
     setClassifications(map);
+    setApproverName(pub.approvalRecord?.approvedByName || '');
+    setApprovalReference(pub.approvalRecord?.approvalReference || '');
+    setApprovalConfirmed(Boolean(pub.approvalRecord?.approved));
     setValidationErrors([]);
     setShowLivePreview(false);
   };
@@ -122,72 +289,229 @@ export const DcmCmsManager: React.FC = () => {
   // Cancel edit
   const handleCancel = () => {
     setEditingPub(null);
+    setEditingExistingId(null);
     setClassifications({});
+    setApproverName('');
+    setApprovalReference('');
+    setApprovalConfirmed(false);
     setValidationErrors([]);
     setShowLivePreview(false);
   };
 
+  // Daily assessment date change: syncs ID (for unsaved drafts), reporting label, period dates, and WAT cut-off
+  const handleDailyAssessmentDateChange = (nextDate: string) => {
+    if (isReadOnlyPublishedDaily) return;
+    const parsed = parseIsoDate(nextDate);
+    setEditingPub((prev) => {
+      if (!prev) return prev;
+      const cutoffTime = prev.evidenceCutoffTimeWat || '17:00';
+      const wat = formatWatCutoff(nextDate, cutoffTime);
+      const label = parsed ? formatDailyDateLabel(nextDate) : prev.reportingPeriodLabel || '';
+      const nextId = editingExistingId
+        ? prev.id
+        : buildDailyPublicationId(nextDate, publications.map((p) => p.id));
+
+      return {
+        ...prev,
+        id: nextId,
+        assessmentDate: nextDate,
+        year: parsed ? parsed.year : prev.year,
+        month: parsed ? parsed.month : prev.month,
+        periodIndex: parsed ? (parsed.day <= 15 ? 1 : 2) : prev.periodIndex,
+        periodStart: nextDate,
+        periodEnd: nextDate,
+        reportingPeriodLabel: label,
+        publicationDate: label,
+        title: parsed ? `Democratic Competitiveness Map — Daily Update: ${label}` : prev.title,
+        evidenceCutoffDate: wat.valid ? wat.displayLabel : prev.evidenceCutoffDate,
+        evidenceCutoffDateTimeWat: wat.valid ? wat.isoWat : ''
+      };
+    });
+  };
+
+  // Daily WAT cut-off time change
+  const handleDailyCutoffTimeChange = (nextTime: string) => {
+    if (isReadOnlyPublishedDaily) return;
+    setEditingPub((prev) => {
+      if (!prev) return prev;
+      const wat = formatWatCutoff(prev.assessmentDate || '', nextTime);
+      return {
+        ...prev,
+        evidenceCutoffTimeWat: nextTime,
+        evidenceCutoffDate: wat.valid ? wat.displayLabel : prev.evidenceCutoffDate,
+        evidenceCutoffDateTimeWat: wat.valid ? wat.isoWat : ''
+      };
+    });
+  };
+
+  // Re-apply carried-forward classifications from a selected approved edition
+  const handleApplyCarryForwardSource = (sourceId: string) => {
+    if (isReadOnlyPublishedDaily) return;
+    const sourcePub = publications.find((p) => p.id === sourceId);
+    if (!sourcePub) return;
+    const carried = carryForwardClassifications(sourcePub);
+    setClassifications(carried);
+    setEditingPub((prev) =>
+      prev
+        ? {
+            ...prev,
+            carriedForwardAllStates: true,
+            carriedForwardFromPublicationId: sourcePub.id
+          }
+        : prev
+    );
+    showStatus(
+      `Carried forward all 37 approved classifications from "${sourcePub.reportingPeriodLabel}" without modification.`
+    );
+  };
+
+  // Toggle Quiet-Day Update mode
+  const handleToggleQuietDay = (checked: boolean) => {
+    if (isReadOnlyPublishedDaily) return;
+    if (checked && carryForwardSourcePub) {
+      const carried = carryForwardClassifications(carryForwardSourcePub);
+      setClassifications(carried);
+      setEditingPub((prev) =>
+        prev
+          ? {
+              ...prev,
+              isQuietDay: true,
+              carriedForwardAllStates: true
+            }
+          : prev
+      );
+      showStatus(
+        'Quiet-day mode enabled: all 37 previously approved classifications are locked to carried-forward values. Enter the Research-approved statement below.'
+      );
+    } else {
+      setEditingPub((prev) => (prev ? { ...prev, isQuietDay: checked } : prev));
+    }
+  };
+
+  // Revert a single state back to its carried-forward approved value
+  const handleRevertStateToCarriedForward = (stateCode: string) => {
+    if (isReadOnlyPublishedDaily || !carryForwardSourcePub) return;
+    const carriedAll = carryForwardClassifications(carryForwardSourcePub);
+    const restored = carriedAll[stateCode];
+    if (!restored) return;
+    setClassifications((prev) => {
+      const next = { ...prev, [stateCode]: restored };
+      const allCarried = Object.values(next).every((r) => Boolean(r.carriedForward));
+      setEditingPub((p) => (p ? { ...p, carriedForwardAllStates: allCarried } : p));
+      return next;
+    });
+  };
+
   // Update classification for a state
   const handleClassificationChange = (stateCode: string, newClass: DcmClassification) => {
+    if (isReadOnlyPublishedDaily) return;
+    if (isEditingDaily && editingPub?.isQuietDay) {
+      showStatus('Quiet-day updates cannot alter state classifications. Uncheck Quiet-Day Update to record approved changes.', 'error');
+      return;
+    }
+
     setClassifications(prev => {
       const existing = prev[stateCode] || {
         stateCode,
         stateName: NIGERIA_37_JURISDICTIONS.find(j => j.code === stateCode)?.name || stateCode,
         classification: 'Insufficient evidence' as DcmClassification
       };
+      const updatedRecord: DcmStateRecord = {
+        ...existing,
+        classification: newClass,
+        ...(isEditingDaily ? { carriedForward: false } : {})
+      };
       return {
         ...prev,
-        [stateCode]: {
-          ...existing,
-          classification: newClass
-        }
+        [stateCode]: updatedRecord
       };
     });
+
+    if (isEditingDaily) {
+      setEditingPub((p) => (p ? { ...p, carriedForwardAllStates: false } : p));
+    }
   };
 
   // Update field for a state
   const handleStateFieldChange = (stateCode: string, field: keyof DcmStateRecord, value: string) => {
+    if (isReadOnlyPublishedDaily) return;
     setClassifications(prev => {
       const existing = prev[stateCode] || {
         stateCode,
         stateName: NIGERIA_37_JURISDICTIONS.find(j => j.code === stateCode)?.name || stateCode,
         classification: 'Insufficient evidence' as DcmClassification
       };
+      const clearsCarryForward =
+        isEditingDaily &&
+        !editingPub?.isQuietDay &&
+        (field === 'keyFinding' || field === 'classificationRationale' || field === 'direction' || field === 'confidence');
+
       return {
         ...prev,
         [stateCode]: {
           ...existing,
-          [field]: value
+          [field]: value,
+          ...(clearsCarryForward ? { carriedForward: false } : {})
         }
       };
     });
+
+    if (
+      isEditingDaily &&
+      !editingPub?.isQuietDay &&
+      (field === 'keyFinding' || field === 'classificationRationale' || field === 'direction' || field === 'confidence')
+    ) {
+      setEditingPub((p) => (p ? { ...p, carriedForwardAllStates: false } : p));
+    }
   };
 
-  // Bulk quick-setters
+  // Bulk quick-setters (disabled for quiet-day or immutable published daily updates)
   const handleBulkSetAll = (targetClass: DcmClassification) => {
+    if (isReadOnlyPublishedDaily || (isEditingDaily && editingPub?.isQuietDay)) return;
     setClassifications(prev => {
       const updated: Record<string, DcmStateRecord> = {};
       for (const [code, rec] of Object.entries(prev)) {
-        updated[code] = { ...rec, classification: targetClass };
+        updated[code] = {
+          ...rec,
+          classification: targetClass,
+          ...(isEditingDaily ? { carriedForward: false } : {})
+        };
       }
       return updated;
     });
+    if (isEditingDaily) {
+      setEditingPub((p) => (p ? { ...p, carriedForwardAllStates: false } : p));
+    }
     showStatus(`All 37 jurisdictions set to "${targetClass}".`);
   };
 
   // Acceptable CSV format generator
   const generateAcceptableCsv = (recordsMap?: Record<string, DcmStateRecord>): string => {
-    const headers = ['state_code', 'state_name', 'classification', 'direction', 'confidence', 'key_finding', 'rationale', 'evidence_summary', 'right_of_response'];
+    const headers = [
+      'state_code',
+      'state_name',
+      'classification',
+      'direction',
+      'confidence',
+      'key_finding',
+      'rationale',
+      'evidence_summary',
+      'right_of_response',
+      'carried_forward',
+      'last_substantive_review_date'
+    ];
     const rows = NIGERIA_37_JURISDICTIONS.map(j => {
       const current = recordsMap?.[j.code] || classifications[j.code];
       const cls = current?.classification || 'Insufficient evidence';
-      const dir = current?.direction || (cls === 'Insufficient evidence' ? 'insufficient-basis' : 'newly-classified');
+      const dir = current?.direction || (cls === 'Insufficient evidence' ? 'insufficient-basis' : 'unchanged');
       const conf = current?.confidence || (cls === 'Insufficient evidence' ? 'Low' : 'Medium');
       const keyF = (current?.keyFinding || current?.classificationRationale || '').replace(/"/g, '""');
       const rat = (current?.classificationRationale || '').replace(/"/g, '""');
       const evi = (current?.evidenceSummary || '').replace(/"/g, '""');
       const ror = current?.rightOfResponseStatus || 'Not required';
-      return `"${j.code}","${j.name}","${cls}","${dir}","${conf}","${keyF}","${rat}","${evi}","${ror}"`;
+      const cf = current?.carriedForward ? 'true' : 'false';
+      const reviewDate = current?.lastSubstantiveReviewDate || '';
+      return `"${j.code}","${j.name}","${cls}","${dir}","${conf}","${keyF}","${rat}","${evi}","${ror}","${cf}","${reviewDate}"`;
     });
 
     // Prepend UTF-8 BOM (\uFEFF) for seamless compatibility across Excel, Numbers, and Google Sheets
@@ -242,14 +566,15 @@ export const DcmCmsManager: React.FC = () => {
     return null;
   };
 
-  // Normalize direction from CSV input
+  // Normalize direction from CSV input (does not auto-fabricate movement claims)
   const normalizeDirection = (val: string, fallbackCls: DcmClassification): string => {
-    if (!val) return fallbackCls === 'Insufficient evidence' ? 'insufficient-basis' : 'newly-classified';
+    if (!val) return fallbackCls === 'Insufficient evidence' ? 'insufficient-basis' : 'unchanged';
     const clean = val.trim().toLowerCase().replace(/\s+/g, '-');
     if (clean.includes('new')) return 'newly-classified';
     if (clean.includes('deteriorat')) return 'deteriorating';
     if (clean.includes('insuffic') || clean.includes('basis')) return 'insufficient-basis';
     if (clean.includes('improv')) return 'improving';
+    if (clean.includes('unchang')) return 'unchanged';
     if (clean.includes('stable')) return 'stable';
     return clean;
   };
@@ -310,6 +635,8 @@ export const DcmCmsManager: React.FC = () => {
     const ratIdx = headerCols.findIndex(c => c === 'rationale' || c.includes('rationale') || c.includes('reason'));
     const eviIdx = headerCols.findIndex(c => c === 'evidence_summary' || c.includes('evidence') || c.includes('summary'));
     const rorIdx = headerCols.findIndex(c => c === 'right_of_response' || c.includes('response') || c.includes('ror'));
+    const cfIdx = headerCols.findIndex(c => c === 'carried_forward' || c.includes('carried'));
+    const reviewIdx = headerCols.findIndex(c => c === 'last_substantive_review_date' || c.includes('review_date'));
 
     if (codeIdx === -1 && nameIdx === -1) {
       throw new Error('CSV must contain at least a "state_code" or "state_name" column.');
@@ -366,6 +693,10 @@ export const DcmCmsManager: React.FC = () => {
       const ror = (RIGHT_OF_RESPONSE_OPTIONS.includes(rawRor as any)) 
         ? (rawRor as RightOfResponseStatus) 
         : 'Not required';
+      const rawCf = (cfIdx >= 0 && cols[cfIdx]) ? cols[cfIdx].trim().toLowerCase() : '';
+      const isCarried = rawCf === 'true' || rawCf === 'yes' || rawCf === '1';
+      const rawReviewDate = (reviewIdx >= 0 && cols[reviewIdx]) ? cols[reviewIdx].trim() : '';
+      const validReviewDate = parseIsoDate(rawReviewDate) ? rawReviewDate : undefined;
 
       records[match.code] = {
         stateCode: match.code,
@@ -376,7 +707,9 @@ export const DcmCmsManager: React.FC = () => {
         keyFinding: rawKeyF || rat,
         classificationRationale: rat || rawKeyF,
         evidenceSummary: evi,
-        rightOfResponseStatus: ror
+        rightOfResponseStatus: ror,
+        carriedForward: isCarried,
+        ...(validReviewDate ? { lastSubstantiveReviewDate: validReviewDate } : {})
       };
 
       matchedCount++;
@@ -387,6 +720,13 @@ export const DcmCmsManager: React.FC = () => {
 
   // Upload CSV inside Publication Editor (updates current 37 jurisdictions)
   const handleUploadCsvInEditor = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (isReadOnlyPublishedDaily) return;
+    if (isEditingDaily && editingPub?.isQuietDay) {
+      showStatus('Disable Quiet-Day Update before importing replacement state classifications.', 'error');
+      e.target.value = '';
+      return;
+    }
+
     const file = e.target.files?.[0];
     if (!file) return;
 
@@ -398,10 +738,26 @@ export const DcmCmsManager: React.FC = () => {
 
         const { records, matchedCount, unmatchedRows } = parseDcmCsv(text);
 
-        setClassifications(prev => ({
-          ...prev,
-          ...records
-        }));
+        setClassifications(prev => {
+          const merged: Record<string, DcmStateRecord> = { ...prev };
+          for (const [code, imported] of Object.entries(records)) {
+            const sourceRec = carryForwardSourcePub?.classifications?.[code];
+            const changedFromSource = sourceRec && sourceRec.classification !== imported.classification;
+            merged[code] = {
+              ...imported,
+              carriedForward: changedFromSource ? false : Boolean(imported.carriedForward),
+              carriedForwardFromPublicationId:
+                !changedFromSource && imported.carriedForward
+                  ? (carryForwardSourcePub?.id || prev[code]?.carriedForwardFromPublicationId)
+                  : undefined
+            };
+          }
+          if (isEditingDaily) {
+            const allCarried = Object.values(merged).every((r) => Boolean(r.carriedForward));
+            setEditingPub((p) => (p ? { ...p, carriedForwardAllStates: allCarried } : p));
+          }
+          return merged;
+        });
 
         let msg = `CSV uploaded: Successfully populated ${matchedCount}/37 jurisdictions.`;
         if (unmatchedRows.length > 0) {
@@ -453,7 +809,7 @@ export const DcmCmsManager: React.FC = () => {
           methodologyVersion: 'Version 1.1',
           revisionNote: 'Uploaded via CSV batch import',
           status: 'draft',
-          isLatest: true,
+          isLatest: false,
           summary: `Imported publication with ${matchedCount} state classifications.`,
           changesSummary: '',
           supportingDocumentUrl: ''
@@ -472,7 +828,7 @@ export const DcmCmsManager: React.FC = () => {
     e.target.value = '';
   };
 
-  // Strict 37-Jurisdiction Validation Before Publishing
+  // Strict 37-Jurisdiction Validation Before Saving Legacy Period Publication
   const validateBeforeSave = (): boolean => {
     const errors: string[] = [];
 
@@ -504,50 +860,219 @@ export const DcmCmsManager: React.FC = () => {
     return errors.length === 0;
   };
 
-  // Save publication handler
-  const handleSave = async () => {
-    if (!validateBeforeSave() || !editingPub) return;
+  // Save Daily DCM publication with explicit target status ('draft' | 'approved' | 'published')
+  const handleSaveDaily = async (targetStatus: 'draft' | 'approved' | 'published') => {
+    if (!editingPub || isSaving || isReadOnlyPublishedDaily) return;
 
+    const wat = formatWatCutoff(
+      editingPub.assessmentDate || '',
+      editingPub.evidenceCutoffTimeWat || ''
+    );
+    const parsedDate = parseIsoDate(editingPub.assessmentDate || '');
+    const nowIso = new Date().toISOString();
+    const dateLabel = editingPub.assessmentDate ? formatDailyDateLabel(editingPub.assessmentDate) : '';
+    const allCarried = Object.values(classifications).every((r) => Boolean(r.carriedForward));
+    const currentUid = auth.currentUser?.uid || '';
+    const currentEmail = auth.currentUser?.email || undefined;
+
+    const approvalRecord =
+      approvalConfirmed && approverName.trim().length >= 2 && approvalReference.trim().length >= 3
+        ? {
+            approved: true,
+            approvalReference: approvalReference.trim(),
+            approvedByName: approverName.trim(),
+            approvedAt: editingPub.approvalRecord?.approvedAt || nowIso,
+            recordedByUid: currentUid,
+            recordedByEmail: currentEmail,
+            recordedAt: nowIso,
+            approvedByUid: currentUid,
+            approvedByEmail: currentEmail,
+            verificationMode: 'admin-recorded-reference' as const
+          }
+        : undefined;
+
+    const candidate: DcmPublication = {
+      id: editingPub.id || buildDailyPublicationId(editingPub.assessmentDate || '', publications.map((p) => p.id)),
+      publicationFormat: 'daily',
+      title: editingPub.title?.trim() || `Democratic Competitiveness Map — Daily Update: ${dateLabel}`,
+      year: parsedDate?.year || Number(editingPub.year) || new Date().getFullYear(),
+      month: parsedDate?.month || Number(editingPub.month) || 1,
+      periodIndex: parsedDate ? (parsedDate.day <= 15 ? 1 : 2) : 1,
+      periodStart: editingPub.assessmentDate || '',
+      periodEnd: editingPub.assessmentDate || '',
+      reportingPeriodLabel: editingPub.reportingPeriodLabel?.trim() || dateLabel,
+      publicationDate: editingPub.publicationDate?.trim() || dateLabel,
+      evidenceCutoffDate: wat.valid ? wat.displayLabel : '',
+      assessmentDate: editingPub.assessmentDate || '',
+      evidenceCutoffTimeWat: editingPub.evidenceCutoffTimeWat || '',
+      evidenceCutoffDateTimeWat: wat.valid ? wat.isoWat : '',
+      publishedAt: targetStatus === 'published' ? nowIso : undefined,
+      isQuietDay: Boolean(editingPub.isQuietDay),
+      carriedForwardAllStates: allCarried,
+      carriedForwardFromPublicationId: editingPub.carriedForwardFromPublicationId,
+      supersedesPublicationId: editingPub.supersedesPublicationId,
+      revisionNumber: editingPub.revisionNumber,
+      approvalRecord,
+      methodologyVersion: editingPub.methodologyVersion || 'Version 1.1',
+      revisionNote: editingPub.revisionNote || '',
+      status: targetStatus,
+      isLatest: targetStatus === 'published',
+      summary: editingPub.summary || '',
+      changesSummary: editingPub.changesSummary || '',
+      supportingDocumentUrl: editingPub.supportingDocumentUrl || '',
+      classifications,
+      createdAt: editingPub.createdAt || Date.now(),
+      updatedAt: Date.now(),
+      createdByUid: editingPub.createdByUid || currentUid || undefined,
+      updatedByUid: currentUid || undefined
+    };
+
+    const validation = validateDailyPublication(candidate, {
+      isAuthorizedAdmin: Boolean(auth.currentUser),
+      actorUid: currentUid || undefined,
+      existingDoc: existingRecord,
+      sourcePub: carryForwardSourcePub
+    });
+
+    const consistency = auditPublicationConsistency(candidate, carryForwardSourcePub);
+    const combinedErrors = [...validation.errors, ...consistency.errors];
+
+    if (combinedErrors.length > 0) {
+      setValidationErrors(combinedErrors);
+      showStatus('Please resolve the validation and consistency requirements before continuing.', 'error');
+      return;
+    }
+
+    setValidationErrors([]);
+    setIsSaving(true);
     try {
-      const finalPub: DcmPublication = {
-        id: editingPub.id || `dcm-${Date.now()}`,
-        title: editingPub.title || 'Democratic Competitiveness Map',
-        year: Number(editingPub.year) || new Date().getFullYear(),
-        month: Number(editingPub.month) || 10,
-        periodIndex: Number(editingPub.periodIndex) || 1,
-        periodStart: editingPub.periodStart || '2026-10-01',
-        periodEnd: editingPub.periodEnd || '2026-10-15',
-        reportingPeriodLabel: editingPub.reportingPeriodLabel || '1st – 15th October 2026',
-        publicationDate: editingPub.publicationDate || new Date().toLocaleDateString('en-GB'),
-        evidenceCutoffDate: editingPub.evidenceCutoffDate || new Date().toLocaleDateString('en-GB'),
-        methodologyVersion: editingPub.methodologyVersion || 'Version 1.1',
-        revisionNote: editingPub.revisionNote || '',
-        status: (editingPub.status as any) || 'published',
-        isLatest: Boolean(editingPub.isLatest),
-        summary: editingPub.summary || '',
-        changesSummary: editingPub.changesSummary || '',
-        supportingDocumentUrl: editingPub.supportingDocumentUrl || '',
-        classifications: classifications,
-        createdAt: editingPub.createdAt || Date.now(),
-        updatedAt: Date.now()
-      };
-
-      await saveDcmPublication(finalPub);
-      showStatus(`Publication "${finalPub.title}" successfully saved.`);
+      await saveDailyDcmPublication(candidate);
+      const actionLabel =
+        targetStatus === 'published'
+          ? 'published (now immutable and visible on the public DCM)'
+          : targetStatus === 'approved'
+          ? 'marked Research-Approved (private in CMS until published)'
+          : 'saved as a private Draft';
+      showStatus(`Daily DCM update "${candidate.reportingPeriodLabel}" ${actionLabel}.`);
       setEditingPub(null);
+      setEditingExistingId(null);
       setClassifications({});
-      setValidationErrors([]);
+      setApproverName('');
+      setApprovalReference('');
+      setApprovalConfirmed(false);
     } catch (err: any) {
-      showStatus(`Failed to save publication: ${err.message}`, 'error');
+      showStatus(`Failed to save daily publication: ${err.message}`, 'error');
+    } finally {
+      setIsSaving(false);
     }
   };
 
-  // Delete publication handler
-  const handleDelete = async (id: string, title: string) => {
-    if (window.confirm(`Are you sure you want to delete publication "${title}"? This action cannot be undone.`)) {
+  // Save legacy reporting-period publication handler (with Stage 2 approval reference & immutability safeguards)
+  const handleSave = async () => {
+    if (isEditingDaily) {
+      await handleSaveDaily('draft');
+      return;
+    }
+    if (!editingPub || isReadOnlyPublishedDaily) return;
+
+    const nowIso = new Date().toISOString();
+    const currentUid = auth.currentUser?.uid || '';
+    const currentEmail = auth.currentUser?.email || undefined;
+    const targetStatus = (editingPub.status as any) || 'draft';
+
+    const approvalRecord =
+      approvalConfirmed && approverName.trim().length >= 2 && approvalReference.trim().length >= 3
+        ? {
+            approved: true,
+            approvalReference: approvalReference.trim(),
+            approvedByName: approverName.trim(),
+            approvedAt: editingPub.approvalRecord?.approvedAt || nowIso,
+            recordedByUid: currentUid,
+            recordedByEmail: currentEmail,
+            recordedAt: nowIso,
+            approvedByUid: currentUid,
+            approvedByEmail: currentEmail,
+            verificationMode: 'admin-recorded-reference' as const
+          }
+        : undefined;
+
+    const finalPub: DcmPublication = {
+      id: editingPub.id || `dcm-${Date.now()}`,
+      publicationFormat: 'legacy-period',
+      title: editingPub.title || 'Democratic Competitiveness Map',
+      year: Number(editingPub.year) || new Date().getFullYear(),
+      month: Number(editingPub.month) || 10,
+      periodIndex: Number(editingPub.periodIndex) || 1,
+      periodStart: editingPub.periodStart || '2026-10-01',
+      periodEnd: editingPub.periodEnd || '2026-10-15',
+      reportingPeriodLabel: editingPub.reportingPeriodLabel || '1st – 15th October 2026',
+      publicationDate: editingPub.publicationDate || new Date().toLocaleDateString('en-GB'),
+      evidenceCutoffDate: editingPub.evidenceCutoffDate || new Date().toLocaleDateString('en-GB'),
+      supersedesPublicationId: editingPub.supersedesPublicationId,
+      revisionNumber: editingPub.revisionNumber,
+      approvalRecord,
+      publishedAt: targetStatus === 'published' ? (editingPub.publishedAt || nowIso) : undefined,
+      methodologyVersion: editingPub.methodologyVersion || 'Version 1.1',
+      revisionNote: editingPub.revisionNote || '',
+      status: targetStatus,
+      isLatest: targetStatus === 'published' ? Boolean(editingPub.isLatest) : false,
+      summary: editingPub.summary || '',
+      changesSummary: editingPub.changesSummary || '',
+      supportingDocumentUrl: editingPub.supportingDocumentUrl || '',
+      classifications: classifications,
+      createdAt: editingPub.createdAt || Date.now(),
+      updatedAt: Date.now(),
+      createdByUid: editingPub.createdByUid || currentUid || undefined,
+      updatedByUid: currentUid || undefined
+    };
+
+    const validation = validateLegacyPublication(finalPub, {
+      isAuthorizedAdmin: Boolean(auth.currentUser),
+      actorUid: currentUid || undefined,
+      existingDoc: existingRecord
+    });
+    const consistency = auditPublicationConsistency(finalPub);
+    const combinedErrors = [...validation.errors, ...consistency.errors];
+
+    if (combinedErrors.length > 0) {
+      setValidationErrors(combinedErrors);
+      showStatus('Please resolve the validation and approval requirements before saving.', 'error');
+      return;
+    }
+
+    setIsSaving(true);
+    try {
+      await saveDcmPublication(finalPub);
+      showStatus(`Publication "${finalPub.title}" successfully saved.`);
+      setEditingPub(null);
+      setEditingExistingId(null);
+      setClassifications({});
+      setApproverName('');
+      setApprovalReference('');
+      setApprovalConfirmed(false);
+      setValidationErrors([]);
+    } catch (err: any) {
+      showStatus(`Failed to save publication: ${err.message}`, 'error');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  // Delete publication handler (protects ALL published editions—daily and legacy—from deletion)
+  const handleDelete = async (pub: DcmPublication) => {
+    if (pub.status === 'published') {
+      showStatus('Published DCM editions are immutable historical records and cannot be deleted. Issue a corrected revision instead.', 'error');
+      return;
+    }
+
+    if (window.confirm(`Are you sure you want to delete "${pub.title}"? This action cannot be undone.`)) {
       try {
-        await deleteDcmPublication(id);
-        showStatus(`Deleted publication "${title}".`);
+        if (isDailyPublication(pub)) {
+          await deleteDailyDcmPublication(pub.id);
+        } else {
+          await deleteDcmPublication(pub.id);
+        }
+        showStatus(`Deleted "${pub.title}".`);
       } catch (err: any) {
         showStatus(`Failed to delete: ${err.message}`, 'error');
       }
@@ -601,8 +1126,68 @@ export const DcmCmsManager: React.FC = () => {
         </div>
       )}
 
-      {/* VIEW 1: PUBLICATIONS LIST (When not editing) */}
-      {!editingPub ? (
+      {/* Stage 3 Top-Level DCM Workspace Tabs (Publications | Public Evidence & Sources | Incident History) */}
+      {!editingPub && (
+        <div className="flex flex-wrap items-center gap-2 bg-paper p-1.5 rounded-2xl border border-line">
+          <button
+            type="button"
+            onClick={() => setDcmSectionTab('publications')}
+            className={`inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-mono font-bold uppercase tracking-wider transition-all cursor-pointer ${
+              dcmSectionTab === 'publications'
+                ? 'bg-brand-blue text-white shadow-xs'
+                : 'text-slate-700 hover:bg-white'
+            }`}
+          >
+            <Award className="w-3.5 h-3.5" />
+            <span>DCM Publications ({publications.length})</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setDcmSectionTab('evidence')}
+            className={`inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-mono font-bold uppercase tracking-wider transition-all cursor-pointer ${
+              dcmSectionTab === 'evidence'
+                ? 'bg-brand-blue text-white shadow-xs'
+                : 'text-slate-700 hover:bg-white'
+            }`}
+          >
+            <FileText className="w-3.5 h-3.5" />
+            <span>Public Evidence & Sources ({dcmEvidence.length})</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setDcmSectionTab('incidents')}
+            className={`inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-mono font-bold uppercase tracking-wider transition-all cursor-pointer ${
+              dcmSectionTab === 'incidents'
+                ? 'bg-brand-blue text-white shadow-xs'
+                : 'text-slate-700 hover:bg-white'
+            }`}
+          >
+            <GitBranch className="w-3.5 h-3.5" />
+            <span>Incident History ({dcmIncidents.length})</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setDcmSectionTab('editorial')}
+            className={`inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-mono font-bold uppercase tracking-wider transition-all cursor-pointer ${
+              dcmSectionTab === 'editorial'
+                ? 'bg-brand-blue text-white shadow-xs'
+                : 'text-slate-700 hover:bg-white'
+            }`}
+          >
+            <Newspaper className="w-3.5 h-3.5" />
+            <span>DCM Editorial Publishing ({dcmEditorialHandovers.length})</span>
+          </button>
+        </div>
+      )}
+
+      {/* Stage 3 Evidence & Incident Managers & Stage 6 Editorial Publishing */}
+      {!editingPub && dcmSectionTab === 'evidence' ? (
+        <DcmEvidenceCmsManager mode="evidence" />
+      ) : !editingPub && dcmSectionTab === 'incidents' ? (
+        <DcmEvidenceCmsManager mode="incidents" />
+      ) : !editingPub && dcmSectionTab === 'editorial' ? (
+        <DcmEditorialPublishingManager />
+      ) : !editingPub ? (
         <div className="space-y-6">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-line pb-4">
             <div>
@@ -613,11 +1198,11 @@ export const DcmCmsManager: React.FC = () => {
                 </h3>
               </div>
               <p className="text-xs text-mut mt-1">
-                Manage bi-weekly and baseline DCM publications, 37-jurisdiction classifications, and period timeline history.
+                Manage Research-approved daily DCM updates and historical reporting-period editions across all 36 states and the FCT.
               </p>
             </div>
 
-            <div className="flex items-center gap-2.5 flex-wrap">
+            <div className="flex items-center gap-2 flex-wrap">
               <input 
                 type="file" 
                 ref={mainListFileInputRef}
@@ -628,22 +1213,51 @@ export const DcmCmsManager: React.FC = () => {
 
               <button
                 type="button"
-                onClick={() => handleDownloadAcceptableCsv(undefined, 'blank_template')}
+                onClick={() => handleStartNewDaily({ isQuietDay: false })}
+                className="inline-flex items-center gap-2 px-4 py-2.5 bg-brand-blue hover:bg-brand-blue-dark text-white rounded-xl text-xs font-bold font-mono tracking-wider uppercase transition-all shadow-sm cursor-pointer shrink-0"
+              >
+                <Plus className="w-4 h-4" />
+                <span>New Daily DCM Update</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleStartNewDaily({ isQuietDay: true })}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 rounded-xl text-xs font-mono font-bold tracking-wider uppercase transition-all shadow-xs cursor-pointer shrink-0"
+                title="Create a daily publication retaining all 37 previously approved classifications without change"
+              >
+                <Clock className="w-3.5 h-3.5 text-emerald-700" />
+                <span>Quiet-Day Update</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleStartNew}
                 className="inline-flex items-center gap-1.5 px-3.5 py-2.5 bg-white hover:bg-slate-50 text-slate-800 border border-slate-300 rounded-xl text-xs font-mono font-bold tracking-wider uppercase transition-all shadow-xs cursor-pointer shrink-0"
+                title="Create a legacy reporting-period publication"
+              >
+                <Calendar className="w-3.5 h-3.5 text-slate-600" />
+                <span>Legacy Period Edition</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleDownloadAcceptableCsv(undefined, 'blank_template')}
+                className="inline-flex items-center gap-1.5 px-3 py-2.5 bg-white hover:bg-slate-50 text-slate-800 border border-slate-300 rounded-xl text-xs font-mono font-semibold transition-all shadow-xs cursor-pointer shrink-0"
                 title="Download standard CSV format with all 37 Nigerian jurisdictions"
               >
                 <Download className="w-3.5 h-3.5 text-brand-blue" />
-                <span>Download Acceptable CSV Format</span>
+                <span>CSV Template</span>
               </button>
 
               <button
                 type="button"
                 onClick={() => mainListFileInputRef.current?.click()}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2.5 bg-purple-50 hover:bg-purple-100 text-brand-purple border border-purple-200 rounded-xl text-xs font-mono font-bold tracking-wider uppercase transition-all shadow-xs cursor-pointer shrink-0"
+                className="inline-flex items-center gap-1.5 px-3 py-2.5 bg-purple-50 hover:bg-purple-100 text-brand-purple border border-purple-200 rounded-xl text-xs font-mono font-semibold transition-all shadow-xs cursor-pointer shrink-0"
                 title="Upload a completed CSV to create a new DCM publication with all 37 states"
               >
                 <UploadCloud className="w-3.5 h-3.5 text-brand-purple" />
-                <span>Upload CSV to New Publication</span>
+                <span>Upload CSV</span>
               </button>
 
               <button
@@ -660,102 +1274,225 @@ export const DcmCmsManager: React.FC = () => {
                 href="/democratic-competitiveness-map"
                 target="_blank"
                 rel="noopener noreferrer"
-                className="inline-flex items-center gap-1.5 px-3.5 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-300 rounded-xl text-xs font-mono font-bold tracking-wider uppercase transition-all shadow-xs cursor-pointer shrink-0"
+                className="inline-flex items-center gap-1.5 px-3 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-300 rounded-xl text-xs font-mono font-bold tracking-wider uppercase transition-all shadow-xs cursor-pointer shrink-0"
               >
                 <Eye className="w-3.5 h-3.5 text-brand-blue" />
-                <span>View Live DCM Map</span>
+                <span>Live Map</span>
               </a>
-
-              <button
-                onClick={handleStartNew}
-                className="inline-flex items-center gap-2 px-4 py-2.5 bg-brand-blue hover:bg-brand-blue-dark text-white rounded-xl text-xs font-bold font-mono tracking-wider uppercase transition-all shadow-sm cursor-pointer shrink-0"
-              >
-                <Plus className="w-4 h-4" />
-                <span>New DCM Publication</span>
-              </button>
             </div>
           </div>
 
-          {/* Publications Cards Grid */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-            {publications.map((pub) => {
-              const classCount = pub.classifications ? Object.keys(pub.classifications).length : 0;
-              const hasAll37 = classCount === 37;
+          {/* Publication Format Filter Tabs */}
+          <div className="flex items-center justify-between flex-wrap gap-3">
+            <div className="inline-flex items-center gap-1.5 bg-paper p-1 rounded-xl border border-line">
+              <button
+                type="button"
+                onClick={() => setFormatFilter('all')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold transition-colors cursor-pointer ${
+                  formatFilter === 'all' ? 'bg-white text-ink shadow-xs' : 'text-mut hover:text-ink'
+                }`}
+              >
+                All Editions ({publications.length})
+              </button>
+              <button
+                type="button"
+                onClick={() => setFormatFilter('daily')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold transition-colors cursor-pointer ${
+                  formatFilter === 'daily' ? 'bg-white text-brand-blue shadow-xs' : 'text-mut hover:text-ink'
+                }`}
+              >
+                Daily Updates ({dailyCount})
+              </button>
+              <button
+                type="button"
+                onClick={() => setFormatFilter('legacy')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold transition-colors cursor-pointer ${
+                  formatFilter === 'legacy' ? 'bg-white text-ink shadow-xs' : 'text-mut hover:text-ink'
+                }`}
+              >
+                Legacy Periods ({legacyCount})
+              </button>
+            </div>
+            <span className="text-[11px] font-mono text-mut">
+              Daily records stored individually in <code className="bg-paper px-1.5 py-0.5 rounded border border-line">/dcm_daily_publications</code> · Historical records protected
+            </span>
+          </div>
 
-              return (
-                <div 
-                  key={pub.id}
-                  className="bg-white border border-line rounded-2xl p-5 shadow-sm hover:shadow-md transition-all flex flex-col justify-between space-y-4"
-                >
-                  <div className="space-y-3">
-                    <div className="flex items-center justify-between gap-2">
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-mono font-bold tracking-wider uppercase border ${
-                          pub.status === 'published' 
-                            ? 'bg-emerald-50 text-emerald-700 border-emerald-200' 
-                            : 'bg-amber-50 text-amber-700 border-amber-200'
-                        }`}>
-                          {pub.status}
-                        </span>
-                        {pub.isLatest && (
-                          <span className="px-2.5 py-0.5 rounded-full text-[10px] font-mono font-bold tracking-wider uppercase bg-blue-50 text-brand-blue border border-blue-200 flex items-center gap-1">
-                            <Sparkles className="w-3 h-3" />
-                            Latest
+          {/* Publications Cards Grid */}
+          {filteredPublicationsList.length === 0 ? (
+            <div className="bg-white border border-dashed border-line rounded-2xl p-8 text-center space-y-3">
+              <p className="text-sm font-semibold text-ink">
+                No {formatFilter === 'daily' ? 'daily DCM updates' : 'matching DCM publications'} found yet.
+              </p>
+              <p className="text-xs text-mut max-w-md mx-auto">
+                Create a new daily DCM draft to carry forward all 37 previously approved classifications without automatic changes.
+              </p>
+              <button
+                type="button"
+                onClick={() => handleStartNewDaily({ isQuietDay: false })}
+                className="inline-flex items-center gap-2 px-4 py-2 bg-brand-blue hover:bg-brand-blue-dark text-white rounded-xl text-xs font-mono font-bold uppercase tracking-wider cursor-pointer"
+              >
+                <Plus className="w-4 h-4" />
+                <span>Create First Daily Update</span>
+              </button>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+              {filteredPublicationsList.map((pub) => {
+                const classCount = pub.classifications ? Object.keys(pub.classifications).length : 0;
+                const hasAll37 = classCount === 37;
+                const daily = isDailyPublication(pub);
+                const isImmutablePublished = pub.status === 'published';
+                const carriedCount = pub.classifications
+                  ? Object.values(pub.classifications).filter((r) => Boolean(r.carriedForward)).length
+                  : 0;
+                const statusBadgeStyle =
+                  pub.status === 'published'
+                    ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                    : pub.status === 'approved'
+                    ? 'bg-blue-50 text-blue-700 border-blue-200'
+                    : 'bg-amber-50 text-amber-700 border-amber-200';
+
+                return (
+                  <div 
+                    key={pub.id}
+                    className="bg-white border border-line rounded-2xl p-5 shadow-sm hover:shadow-md transition-all flex flex-col justify-between space-y-4"
+                  >
+                    <div className="space-y-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold tracking-wider uppercase border ${
+                            daily
+                              ? 'bg-indigo-50 text-indigo-700 border-indigo-200'
+                              : 'bg-slate-100 text-slate-700 border-slate-200'
+                          }`}>
+                            {daily ? 'Daily Update' : 'Legacy Period'}
                           </span>
-                        )}
-                        <span className="text-[10px] font-mono text-mut">
-                          {pub.methodologyVersion || 'v1.1'}
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold tracking-wider uppercase border ${statusBadgeStyle}`}>
+                            {pub.status}
+                          </span>
+                          {pub.isQuietDay && (
+                            <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold tracking-wider uppercase bg-teal-50 text-teal-800 border border-teal-200">
+                              Quiet Day
+                            </span>
+                          )}
+                          {isImmutablePublished && (
+                            <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold tracking-wider uppercase bg-slate-100 text-slate-700 border border-slate-300 inline-flex items-center gap-1">
+                              <Lock className="w-2.5 h-2.5" />
+                              Immutable
+                            </span>
+                          )}
+                          {pub.isLatest && pub.status === 'published' && (
+                            <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold tracking-wider uppercase bg-blue-50 text-brand-blue border border-blue-200 flex items-center gap-1">
+                              <Sparkles className="w-3 h-3" />
+                              Latest
+                            </span>
+                          )}
+                        </div>
+
+                        <span className={`text-[11px] font-mono font-bold px-2 py-0.5 rounded shrink-0 ${
+                          hasAll37 ? 'bg-emerald-100/60 text-emerald-800' : 'bg-red-100 text-red-800'
+                        }`}>
+                          {classCount}/37 Classified
                         </span>
                       </div>
 
-                      <span className={`text-[11px] font-mono font-bold px-2 py-0.5 rounded ${
-                        hasAll37 ? 'bg-emerald-100/60 text-emerald-800' : 'bg-red-100 text-red-800'
-                      }`}>
-                        {classCount}/37 Classified
+                      <h4 className="font-display font-bold text-lg text-ink leading-snug">
+                        {pub.title}
+                      </h4>
+
+                      <div className="space-y-1 text-xs text-mut font-mono">
+                        <div className="flex items-center gap-2">
+                          <Calendar className="w-3.5 h-3.5 shrink-0" />
+                          <span>{pub.reportingPeriodLabel}</span>
+                          <span className="text-[10px] text-slate-400">· {pub.methodologyVersion || 'v1.1'}</span>
+                        </div>
+                        {daily && pub.evidenceCutoffDate && (
+                          <div className="flex items-center gap-2 text-indigo-700">
+                            <Clock className="w-3.5 h-3.5 shrink-0" />
+                            <span>Cut-off: {pub.evidenceCutoffDate}</span>
+                          </div>
+                        )}
+                        {daily && carriedCount > 0 && (
+                          <div className="text-[11px] text-slate-600">
+                            {carriedCount === 37
+                              ? 'All 37 classifications carried forward from prior approved edition'
+                              : `${carriedCount}/37 classifications carried forward · ${37 - carriedCount} updated`}
+                          </div>
+                        )}
+                      </div>
+
+                      <p className="text-xs text-ink2 line-clamp-2 leading-relaxed">
+                        {pub.summary || 'No Research-approved summary entered yet.'}
+                      </p>
+                    </div>
+
+                    <div className="pt-3 border-t border-line flex items-center justify-between gap-2 flex-wrap">
+                      <span className="text-[10px] font-mono text-mut">
+                        {daily && pub.publishedAt
+                          ? `Published: ${formatTimestampInWat(pub.publishedAt)}`
+                          : `Pub date: ${pub.publicationDate}`}
                       </span>
+
+                      <div className="flex items-center gap-2">
+                        {isImmutablePublished && (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => handleStartNewDaily({ isQuietDay: false, sourcePub: pub })}
+                              className="px-2.5 py-1.5 rounded-lg bg-indigo-50 hover:bg-indigo-100 text-indigo-800 text-xs font-semibold font-mono flex items-center gap-1 transition-colors cursor-pointer"
+                              title="Create a new daily update carrying forward classifications from this published edition"
+                            >
+                              <Copy className="w-3.5 h-3.5" />
+                              <span>New Daily</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleCreateCorrectionRevision(pub)}
+                              className="px-2.5 py-1.5 rounded-lg bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-200 text-xs font-semibold font-mono flex items-center gap-1 transition-colors cursor-pointer"
+                              title="Issue a new versioned correction draft while preserving this published record intact"
+                            >
+                              <RotateCcw className="w-3.5 h-3.5" />
+                              <span>Correct (New Version)</span>
+                            </button>
+                          </>
+                        )}
+
+                        <button
+                          type="button"
+                          onClick={() => handleEdit(pub)}
+                          className="px-3 py-1.5 rounded-lg bg-paper hover:bg-line text-ink text-xs font-semibold font-mono flex items-center gap-1.5 transition-colors cursor-pointer"
+                        >
+                          {isImmutablePublished ? (
+                            <>
+                              <Eye className="w-3.5 h-3.5 text-slate-600" />
+                              <span>View Record</span>
+                            </>
+                          ) : (
+                            <>
+                              <Edit3 className="w-3.5 h-3.5 text-brand-blue" />
+                              <span>Edit</span>
+                            </>
+                          )}
+                        </button>
+
+                        {!isImmutablePublished && (
+                          <button
+                            type="button"
+                            onClick={() => handleDelete(pub)}
+                            className="p-1.5 rounded-lg text-mut hover:text-red-600 hover:bg-red-50 transition-colors cursor-pointer"
+                            title="Delete publication"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        )}
+                      </div>
                     </div>
-
-                    <h4 className="font-display font-bold text-lg text-ink leading-snug">
-                      {pub.title}
-                    </h4>
-
-                    <div className="flex items-center gap-2 text-xs text-mut font-mono">
-                      <Calendar className="w-3.5 h-3.5" />
-                      <span>{pub.reportingPeriodLabel}</span>
-                    </div>
-
-                    <p className="text-xs text-ink2 line-clamp-2 leading-relaxed">
-                      {pub.summary || 'No summary provided.'}
-                    </p>
                   </div>
-
-                  <div className="pt-3 border-t border-line flex items-center justify-between gap-2">
-                    <span className="text-[10px] font-mono text-mut">
-                      Pub date: {pub.publicationDate}
-                    </span>
-
-                    <div className="flex items-center gap-2">
-                      <button
-                        onClick={() => handleEdit(pub)}
-                        className="px-3 py-1.5 rounded-lg bg-paper hover:bg-line text-ink text-xs font-semibold font-mono flex items-center gap-1.5 transition-colors cursor-pointer"
-                      >
-                        <Edit3 className="w-3.5 h-3.5 text-brand-blue" />
-                        <span>Edit</span>
-                      </button>
-
-                      <button
-                        onClick={() => handleDelete(pub.id, pub.title)}
-                        className="p-1.5 rounded-lg text-mut hover:text-red-600 hover:bg-red-50 transition-colors cursor-pointer"
-                        title="Delete publication"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       ) : (
         /* VIEW 2: PUBLICATION EDITOR & 37-JURISDICTION MATRIX */
@@ -763,10 +1500,23 @@ export const DcmCmsManager: React.FC = () => {
           {/* Editor Header */}
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-line pb-5">
             <div className="space-y-1">
-              <div className="flex items-center gap-2">
-                <span className="px-2.5 py-0.5 rounded text-[10px] font-mono font-bold uppercase tracking-wider bg-brand-blue text-white">
-                  DCM Publication Editor
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className={`px-2.5 py-0.5 rounded text-[10px] font-mono font-bold uppercase tracking-wider text-white ${
+                  isEditingDaily ? 'bg-indigo-700' : 'bg-brand-blue'
+                }`}>
+                  {isEditingDaily ? 'Daily DCM Publication Editor' : 'Legacy Period DCM Editor'}
                 </span>
+                {isEditingDaily && editingPub.isQuietDay && (
+                  <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold uppercase tracking-wider bg-teal-100 text-teal-800 border border-teal-200">
+                    Quiet-Day Update
+                  </span>
+                )}
+                {isReadOnlyPublishedDaily && (
+                  <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold uppercase tracking-wider bg-slate-200 text-slate-800 inline-flex items-center gap-1">
+                    <Lock className="w-3 h-3" />
+                    Published · Read-Only
+                  </span>
+                )}
                 <span className="text-xs font-mono text-mut">
                   {editingPub.id}
                 </span>
@@ -795,19 +1545,74 @@ export const DcmCmsManager: React.FC = () => {
                 onClick={handleCancel}
                 className="px-3.5 py-2 rounded-xl text-xs font-mono font-semibold bg-white hover:bg-line text-mut hover:text-ink border border-line transition-all cursor-pointer"
               >
-                Cancel
+                {isReadOnlyPublishedDaily ? 'Back to List' : 'Cancel'}
               </button>
 
-              <button
-                type="button"
-                onClick={handleSave}
-                className="px-5 py-2 rounded-xl text-xs font-mono font-bold tracking-wider uppercase bg-brand-green hover:bg-emerald-700 text-white shadow-sm flex items-center gap-2 transition-all cursor-pointer"
-              >
-                <Save className="w-4 h-4" />
-                <span>Save Publication</span>
-              </button>
+              {!isReadOnlyPublishedDaily ? (
+                !isEditingDaily ? (
+                  <button
+                    type="button"
+                    disabled={isSaving}
+                    onClick={handleSave}
+                    className="px-5 py-2 rounded-xl text-xs font-mono font-bold tracking-wider uppercase bg-brand-green hover:bg-emerald-700 disabled:opacity-50 text-white shadow-sm flex items-center gap-2 transition-all cursor-pointer"
+                  >
+                    <Save className="w-4 h-4" />
+                    <span>{isSaving ? 'Saving...' : 'Save Publication'}</span>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    disabled={isSaving}
+                    onClick={() => handleSaveDaily('draft')}
+                    className="px-4 py-2 rounded-xl text-xs font-mono font-bold tracking-wider uppercase bg-slate-800 hover:bg-slate-900 disabled:opacity-50 text-white shadow-sm flex items-center gap-2 transition-all cursor-pointer"
+                  >
+                    <Save className="w-4 h-4" />
+                    <span>{isSaving ? 'Saving...' : 'Save Draft'}</span>
+                  </button>
+                )
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => existingRecord && handleCreateCorrectionRevision(existingRecord)}
+                    className="px-4 py-2 rounded-xl text-xs font-mono font-bold tracking-wider uppercase bg-amber-600 hover:bg-amber-700 text-white shadow-sm flex items-center gap-2 transition-all cursor-pointer"
+                  >
+                    <RotateCcw className="w-4 h-4" />
+                    <span>Issue Corrected Revision</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => existingRecord && handleStartNewDaily({ isQuietDay: false, sourcePub: existingRecord })}
+                    className="px-4 py-2 rounded-xl text-xs font-mono font-bold tracking-wider uppercase bg-brand-blue hover:bg-brand-blue-dark text-white shadow-sm flex items-center gap-2 transition-all cursor-pointer"
+                  >
+                    <Copy className="w-4 h-4" />
+                    <span>Start New Daily From This</span>
+                  </button>
+                </>
+              )}
             </div>
           </div>
+
+          {/* Read-Only Immutability Notice */}
+          {isReadOnlyPublishedDaily && (
+            <div className="bg-slate-100 border border-slate-300 rounded-xl p-4 flex items-start gap-3 text-xs text-slate-800">
+              <Lock className="w-4 h-4 text-slate-700 shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <div className="font-bold">Published Historical Record (Immutable)</div>
+                <p>
+                  This DCM publication is locked against overwrite or deletion to preserve historical integrity
+                  {editingPub.publishedAt ? ` (released ${formatTimestampInWat(editingPub.publishedAt)})` : ''}.
+                  {editingPub.approvalRecord?.approvalReference && (
+                    <> Documented Research reference: <strong>{editingPub.approvalRecord.approvalReference}</strong>.</>
+                  )}
+                  {editingPub.approvalRecord?.recordedByEmail && (
+                    <> Recorded by admin: <strong>{editingPub.approvalRecord.recordedByEmail}</strong>.</>
+                  )}{' '}
+                  To issue a subsequent correction while preserving this version, click <strong>Issue Corrected Revision</strong>.
+                </p>
+              </div>
+            </div>
+          )}
 
           {/* Validation Errors Box */}
           {validationErrors.length > 0 && (
@@ -824,173 +1629,373 @@ export const DcmCmsManager: React.FC = () => {
             </div>
           )}
 
-          {/* Section 1: Publication Metadata */}
-          <div className="bg-white border border-line rounded-xl p-5 space-y-4">
-            <h4 className="font-display font-bold text-sm text-ink uppercase tracking-wider flex items-center gap-2 border-b border-line pb-2">
-              <FileSpreadsheet className="w-4 h-4 text-brand-blue" />
-              <span>Publication Metadata & Timeline Indexing</span>
-            </h4>
-
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <div className="space-y-1 md:col-span-2">
-                <label className="block text-[10px] font-mono font-bold uppercase text-mut">Publication Title</label>
-                <input 
-                  type="text"
-                  value={editingPub.title || ''}
-                  onChange={e => setEditingPub(p => ({ ...p, title: e.target.value }))}
-                  placeholder="e.g. Democratic Competitiveness Map: 1st – 15th October 2026"
-                  className="w-full text-xs p-2.5 border border-line rounded-lg font-semibold focus:outline-none focus:border-brand-blue"
-                />
+          {/* Section 1: Publication Metadata (Daily vs Legacy Period) */}
+          {isEditingDaily ? (
+            <div className="bg-white border border-line rounded-xl p-5 space-y-5">
+              <div className="flex items-center justify-between flex-wrap gap-2 border-b border-line pb-2">
+                <h4 className="font-display font-bold text-sm text-ink uppercase tracking-wider flex items-center gap-2">
+                  <Clock className="w-4 h-4 text-indigo-700" />
+                  <span>Daily Publication Metadata, WAT Cut-Off & Carry-Forward</span>
+                </h4>
+                <span className="text-[11px] font-mono text-mut">
+                  Current Status: <strong className="uppercase text-ink">{editingPub.status || 'draft'}</strong>
+                </span>
               </div>
 
-              <div className="space-y-1">
-                <label className="block text-[10px] font-mono font-bold uppercase text-mut">Publication Status</label>
-                <select 
-                  value={editingPub.status || 'draft'}
-                  onChange={e => setEditingPub(p => ({ ...p, status: e.target.value as any }))}
-                  className="w-full text-xs p-2.5 border border-line rounded-lg font-semibold font-mono focus:outline-none focus:border-brand-blue bg-white"
-                >
-                  <option value="draft">Draft (Private in CMS)</option>
-                  <option value="published">Published (Visible to Public)</option>
-                  <option value="archived">Archived</option>
-                </select>
-              </div>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div className="space-y-1 md:col-span-2">
+                  <label className="block text-[10px] font-mono font-bold uppercase text-mut">Daily Publication Title</label>
+                  <input
+                    type="text"
+                    disabled={isReadOnlyPublishedDaily}
+                    value={editingPub.title || ''}
+                    onChange={e => setEditingPub(p => ({ ...p, title: e.target.value }))}
+                    placeholder="e.g. Democratic Competitiveness Map — Daily Update: 19 November 2026"
+                    className="w-full text-xs p-2.5 border border-line rounded-lg font-semibold focus:outline-none focus:border-brand-blue disabled:bg-slate-50"
+                  />
+                </div>
 
-              <div className="space-y-1">
-                <label className="block text-[10px] font-mono font-bold uppercase text-mut">Reporting Period Label</label>
-                <input 
-                  type="text"
-                  value={editingPub.reportingPeriodLabel || ''}
-                  onChange={e => setEditingPub(p => ({ ...p, reportingPeriodLabel: e.target.value }))}
-                  placeholder="e.g. 1st – 15th October 2026"
-                  className="w-full text-xs p-2.5 border border-line rounded-lg font-semibold focus:outline-none focus:border-brand-blue"
-                />
-              </div>
+                <div className="space-y-1">
+                  <label className="block text-[10px] font-mono font-bold uppercase text-mut">Unique Publication ID</label>
+                  <input
+                    type="text"
+                    disabled
+                    value={editingPub.id || ''}
+                    className="w-full text-xs p-2.5 border border-line rounded-lg font-mono bg-slate-50 text-slate-600"
+                  />
+                </div>
 
-              <div className="space-y-1">
-                <label className="block text-[10px] font-mono font-bold uppercase text-mut">Period Start Date</label>
-                <input 
-                  type="date"
-                  value={editingPub.periodStart || ''}
-                  onChange={e => setEditingPub(p => ({ ...p, periodStart: e.target.value }))}
-                  className="w-full text-xs p-2.5 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue"
-                />
-              </div>
+                <div className="space-y-1">
+                  <label className="block text-[10px] font-mono font-bold uppercase text-mut">Assessment Date (YYYY-MM-DD)</label>
+                  <input
+                    type="date"
+                    disabled={isReadOnlyPublishedDaily}
+                    value={editingPub.assessmentDate || ''}
+                    onChange={e => handleDailyAssessmentDateChange(e.target.value)}
+                    className="w-full text-xs p-2.5 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue disabled:bg-slate-50"
+                  />
+                </div>
 
-              <div className="space-y-1">
-                <label className="block text-[10px] font-mono font-bold uppercase text-mut">Period End Date</label>
-                <input 
-                  type="date"
-                  value={editingPub.periodEnd || ''}
-                  onChange={e => setEditingPub(p => ({ ...p, periodEnd: e.target.value }))}
-                  className="w-full text-xs p-2.5 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue"
-                />
-              </div>
+                <div className="space-y-1">
+                  <label className="block text-[10px] font-mono font-bold uppercase text-mut">
+                    Evidence Cut-Off Time ({WAT_LABEL})
+                  </label>
+                  <input
+                    type="time"
+                    disabled={isReadOnlyPublishedDaily}
+                    value={editingPub.evidenceCutoffTimeWat || '17:00'}
+                    onChange={e => handleDailyCutoffTimeChange(e.target.value)}
+                    className="w-full text-xs p-2.5 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue disabled:bg-slate-50"
+                  />
+                </div>
 
-              <div className="space-y-1">
-                <label className="block text-[10px] font-mono font-bold uppercase text-mut">Year</label>
-                <input 
-                  type="number"
-                  value={editingPub.year || 2026}
-                  onChange={e => setEditingPub(p => ({ ...p, year: Number(e.target.value) }))}
-                  className="w-full text-xs p-2.5 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue"
-                />
-              </div>
+                <div className="space-y-1">
+                  <label className="block text-[10px] font-mono font-bold uppercase text-mut">Methodology Version</label>
+                  <input
+                    type="text"
+                    disabled={isReadOnlyPublishedDaily}
+                    value={editingPub.methodologyVersion || 'Version 1.1'}
+                    onChange={e => setEditingPub(p => ({ ...p, methodologyVersion: e.target.value }))}
+                    className="w-full text-xs p-2.5 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue disabled:bg-slate-50"
+                  />
+                </div>
 
-              <div className="space-y-1">
-                <label className="block text-[10px] font-mono font-bold uppercase text-mut">Month (1-12)</label>
-                <select 
-                  value={editingPub.month || 10}
-                  onChange={e => setEditingPub(p => ({ ...p, month: Number(e.target.value) }))}
-                  className="w-full text-xs p-2.5 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue bg-white"
-                >
-                  {MONTH_NAMES.map((m, idx) => (
-                    <option key={idx + 1} value={idx + 1}>{m} ({idx + 1})</option>
-                  ))}
-                </select>
-              </div>
+                {/* Live WAT Cut-off Preview Bar */}
+                <div className="md:col-span-3 p-3 rounded-xl bg-indigo-50/70 border border-indigo-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+                  <div className="flex items-center gap-2 text-indigo-950">
+                    <Clock className="w-4 h-4 text-indigo-700 shrink-0" />
+                    <span>
+                      <strong>Formatted WAT Cut-Off:</strong>{' '}
+                      {dailyWatPreview?.valid ? dailyWatPreview.displayLabel : 'Enter a valid assessment date and 24-hour WAT time.'}
+                    </span>
+                  </div>
+                  {dailyWatPreview?.valid && (
+                    <code className="text-[11px] font-mono bg-white px-2 py-0.5 rounded border border-indigo-200 text-indigo-800">
+                      {dailyWatPreview.isoWat}
+                    </code>
+                  )}
+                </div>
 
-              <div className="space-y-1">
-                <label className="block text-[10px] font-mono font-bold uppercase text-mut">Period Index</label>
-                <select 
-                  value={editingPub.periodIndex || 1}
-                  onChange={e => setEditingPub(p => ({ ...p, periodIndex: Number(e.target.value) }))}
-                  className="w-full text-xs p-2.5 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue bg-white"
-                >
-                  <option value={1}>P1: 1st – 15th of month</option>
-                  <option value={2}>P2: 16th – Month end</option>
-                </select>
-              </div>
+                {/* Carry-Forward Source Control */}
+                <div className="md:col-span-3 p-4 rounded-xl bg-slate-50 border border-line space-y-3">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div>
+                      <div className="text-xs font-bold text-ink">Carry Forward Previously Approved Classifications</div>
+                      <p className="text-[11px] text-mut mt-0.5">
+                        A new day never automatically changes state classifications. Previously approved classifications remain carried forward until Research-approved replacement assessments are entered.
+                      </p>
+                    </div>
+                    {!isReadOnlyPublishedDaily && publishedSourceOptions.length > 0 && (
+                      <div className="flex items-center gap-2 flex-wrap shrink-0">
+                        <select
+                          value={editingPub.carriedForwardFromPublicationId || ''}
+                          onChange={(e) => {
+                            const nextId = e.target.value;
+                            setEditingPub((p) => (p ? { ...p, carriedForwardFromPublicationId: nextId || undefined } : p));
+                          }}
+                          className="text-xs py-1.5 px-2.5 border border-line rounded-lg font-mono bg-white"
+                        >
+                          <option value="">Select prior approved edition...</option>
+                          {publishedSourceOptions.map((opt) => (
+                            <option key={opt.id} value={opt.id}>
+                              {opt.reportingPeriodLabel} ({isDailyPublication(opt) ? 'Daily' : 'Legacy'})
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          type="button"
+                          disabled={!editingPub.carriedForwardFromPublicationId}
+                          onClick={() =>
+                            editingPub.carriedForwardFromPublicationId &&
+                            handleApplyCarryForwardSource(editingPub.carriedForwardFromPublicationId)
+                          }
+                          className="px-3 py-1.5 rounded-lg bg-white hover:bg-slate-100 disabled:opacity-50 text-ink border border-slate-300 text-xs font-mono font-bold flex items-center gap-1.5 cursor-pointer"
+                        >
+                          <RotateCcw className="w-3.5 h-3.5 text-brand-blue" />
+                          <span>Carry Forward All 37</span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
 
-              <div className="space-y-1">
-                <label className="block text-[10px] font-mono font-bold uppercase text-mut">Methodology Version</label>
-                <input 
-                  type="text"
-                  value={editingPub.methodologyVersion || 'Version 1.1'}
-                  onChange={e => setEditingPub(p => ({ ...p, methodologyVersion: e.target.value }))}
-                  placeholder="e.g. Version 1.1"
-                  className="w-full text-xs p-2.5 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue"
-                />
-              </div>
+                  {/* Quiet-Day Toggle */}
+                  <div className="pt-2 border-t border-line flex items-start gap-2.5">
+                    <input
+                      type="checkbox"
+                      id="dcm-quiet-day-toggle"
+                      disabled={isReadOnlyPublishedDaily}
+                      checked={Boolean(editingPub.isQuietDay)}
+                      onChange={(e) => handleToggleQuietDay(e.target.checked)}
+                      className="rounded text-teal-700 focus:ring-teal-600 w-4 h-4 mt-0.5 cursor-pointer disabled:cursor-not-allowed"
+                    />
+                    <label htmlFor="dcm-quiet-day-toggle" className="text-xs text-ink cursor-pointer">
+                      <span className="font-bold">Quiet-Day Update (No classification changes)</span>
+                      <span className="block text-[11px] text-mut mt-0.5">
+                        Locks all 37 state classifications to the carried-forward approved snapshot. Enter the Research-approved quiet-day statement below, including the actual evidence cut-off time (WAT). The CMS never auto-asserts that no incidents occurred.
+                      </span>
+                    </label>
+                  </div>
+                </div>
 
-              <div className="space-y-1">
-                <label className="block text-[10px] font-mono font-bold uppercase text-mut">Publication Date</label>
-                <input 
-                  type="text"
-                  value={editingPub.publicationDate || ''}
-                  onChange={e => setEditingPub(p => ({ ...p, publicationDate: e.target.value }))}
-                  placeholder="e.g. 16 October 2026"
-                  className="w-full text-xs p-2.5 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue"
-                />
-              </div>
+                {/* Research-Approved Daily Summary / Quiet-Day Statement */}
+                <div className="md:col-span-3 space-y-1">
+                  <label className="block text-[10px] font-mono font-bold uppercase text-mut">
+                    {editingPub.isQuietDay
+                      ? 'Research-Approved Quiet-Day Statement (Include Actual WAT Cut-Off Time)'
+                      : 'Research-Approved Daily Summary'}
+                  </label>
+                  <textarea
+                    rows={4}
+                    disabled={isReadOnlyPublishedDaily}
+                    value={editingPub.summary || ''}
+                    onChange={e => setEditingPub(p => ({ ...p, summary: e.target.value }))}
+                    placeholder={
+                      editingPub.isQuietDay
+                        ? `Enter the Research-approved statement verbatim, including the actual cut-off time (e.g. "${dailyWatPreview?.displayLabel || '19 November 2026, 17:00 WAT (UTC+01:00)'}"). Do not rely on automated text.`
+                        : 'Enter the Research-approved daily summary verbatim...'
+                    }
+                    className="w-full text-xs p-2.5 border border-line rounded-lg focus:outline-none focus:border-brand-blue disabled:bg-slate-50"
+                  />
+                </div>
 
-              <div className="space-y-1">
-                <label className="block text-[10px] font-mono font-bold uppercase text-mut">Evidence Cut-off Date</label>
-                <input 
-                  type="text"
-                  value={editingPub.evidenceCutoffDate || ''}
-                  onChange={e => setEditingPub(p => ({ ...p, evidenceCutoffDate: e.target.value }))}
-                  placeholder="e.g. 15 October 2026"
-                  className="w-full text-xs p-2.5 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue"
-                />
-              </div>
-
-              <div className="md:col-span-3 flex items-center gap-2 pt-1">
-                <input 
-                  type="checkbox"
-                  id="isLatest"
-                  checked={Boolean(editingPub.isLatest)}
-                  onChange={e => setEditingPub(p => ({ ...p, isLatest: e.target.checked }))}
-                  className="rounded text-brand-blue focus:ring-brand-blue w-4 h-4 cursor-pointer"
-                />
-                <label htmlFor="isLatest" className="text-xs font-semibold text-ink cursor-pointer">
-                  Mark as Latest Publication (Default view for visitors at /democratic-competitiveness-map)
-                </label>
-              </div>
-
-              <div className="md:col-span-3 space-y-1">
-                <label className="block text-[10px] font-mono font-bold uppercase text-mut">Executive Summary / National Overview</label>
-                <textarea 
-                  rows={3}
-                  value={editingPub.summary || ''}
-                  onChange={e => setEditingPub(p => ({ ...p, summary: e.target.value }))}
-                  placeholder="Key national findings, regional deterioration, and contextual analysis..."
-                  className="w-full text-xs p-2.5 border border-line rounded-lg focus:outline-none focus:border-brand-blue"
-                />
-              </div>
-
-              <div className="md:col-span-3 space-y-1">
-                <label className="block text-[10px] font-mono font-bold uppercase text-mut">Revision Notes / Methodology Changes (Optional)</label>
-                <input 
-                  type="text"
-                  value={editingPub.revisionNote || ''}
-                  onChange={e => setEditingPub(p => ({ ...p, revisionNote: e.target.value }))}
-                  placeholder="e.g. Initial baseline benchmark or updated evidence threshold..."
-                  className="w-full text-xs p-2.5 border border-line rounded-lg focus:outline-none focus:border-brand-blue"
-                />
+                <div className="md:col-span-3 space-y-1">
+                  <label className="block text-[10px] font-mono font-bold uppercase text-mut">
+                    Revision Notes / Editorial Reference (Optional)
+                  </label>
+                  <input
+                    type="text"
+                    disabled={isReadOnlyPublishedDaily}
+                    value={editingPub.revisionNote || ''}
+                    onChange={e => setEditingPub(p => ({ ...p, revisionNote: e.target.value }))}
+                    placeholder="Optional internal editorial or methodology note..."
+                    className="w-full text-xs p-2.5 border border-line rounded-lg focus:outline-none focus:border-brand-blue disabled:bg-slate-50"
+                  />
+                </div>
               </div>
             </div>
-          </div>
+          ) : (
+            <div className="bg-white border border-line rounded-xl p-5 space-y-4">
+              <h4 className="font-display font-bold text-sm text-ink uppercase tracking-wider flex items-center gap-2 border-b border-line pb-2">
+                <FileSpreadsheet className="w-4 h-4 text-brand-blue" />
+                <span>Publication Metadata & Timeline Indexing (Legacy Reporting Period)</span>
+              </h4>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div className="space-y-1 md:col-span-2">
+                  <label className="block text-[10px] font-mono font-bold uppercase text-mut">Publication Title</label>
+                  <input 
+                    type="text"
+                    disabled={isReadOnlyPublishedDaily}
+                    value={editingPub.title || ''}
+                    onChange={e => setEditingPub(p => ({ ...p, title: e.target.value }))}
+                    placeholder="e.g. Democratic Competitiveness Map: 1st – 15th October 2026"
+                    className="w-full text-xs p-2.5 border border-line rounded-lg font-semibold focus:outline-none focus:border-brand-blue disabled:bg-slate-50"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="block text-[10px] font-mono font-bold uppercase text-mut">Publication Status</label>
+                  <select 
+                    disabled={isReadOnlyPublishedDaily}
+                    value={editingPub.status || 'draft'}
+                    onChange={e => setEditingPub(p => ({ ...p, status: e.target.value as any }))}
+                    className="w-full text-xs p-2.5 border border-line rounded-lg font-semibold font-mono focus:outline-none focus:border-brand-blue bg-white disabled:bg-slate-50"
+                  >
+                    <option value="draft">Draft (Private in CMS)</option>
+                    <option value="approved">Approved (Ready to Publish — Private)</option>
+                    <option value="published">Published (Visible to Public)</option>
+                    <option value="archived">Archived</option>
+                  </select>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="block text-[10px] font-mono font-bold uppercase text-mut">Reporting Period Label</label>
+                  <input 
+                    type="text"
+                    disabled={isReadOnlyPublishedDaily}
+                    value={editingPub.reportingPeriodLabel || ''}
+                    onChange={e => setEditingPub(p => ({ ...p, reportingPeriodLabel: e.target.value }))}
+                    placeholder="e.g. 1st – 15th October 2026"
+                    className="w-full text-xs p-2.5 border border-line rounded-lg font-semibold focus:outline-none focus:border-brand-blue disabled:bg-slate-50"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="block text-[10px] font-mono font-bold uppercase text-mut">Period Start Date</label>
+                  <input 
+                    type="date"
+                    disabled={isReadOnlyPublishedDaily}
+                    value={editingPub.periodStart || ''}
+                    onChange={e => setEditingPub(p => ({ ...p, periodStart: e.target.value }))}
+                    className="w-full text-xs p-2.5 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue disabled:bg-slate-50"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="block text-[10px] font-mono font-bold uppercase text-mut">Period End Date</label>
+                  <input 
+                    type="date"
+                    disabled={isReadOnlyPublishedDaily}
+                    value={editingPub.periodEnd || ''}
+                    onChange={e => setEditingPub(p => ({ ...p, periodEnd: e.target.value }))}
+                    className="w-full text-xs p-2.5 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue disabled:bg-slate-50"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="block text-[10px] font-mono font-bold uppercase text-mut">Year</label>
+                  <input 
+                    type="number"
+                    disabled={isReadOnlyPublishedDaily}
+                    value={editingPub.year || 2026}
+                    onChange={e => setEditingPub(p => ({ ...p, year: Number(e.target.value) }))}
+                    className="w-full text-xs p-2.5 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue disabled:bg-slate-50"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="block text-[10px] font-mono font-bold uppercase text-mut">Month (1-12)</label>
+                  <select 
+                    disabled={isReadOnlyPublishedDaily}
+                    value={editingPub.month || 10}
+                    onChange={e => setEditingPub(p => ({ ...p, month: Number(e.target.value) }))}
+                    className="w-full text-xs p-2.5 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue bg-white disabled:bg-slate-50"
+                  >
+                    {MONTH_NAMES.map((m, idx) => (
+                      <option key={idx + 1} value={idx + 1}>{m} ({idx + 1})</option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="block text-[10px] font-mono font-bold uppercase text-mut">Period Index</label>
+                  <select 
+                    disabled={isReadOnlyPublishedDaily}
+                    value={editingPub.periodIndex || 1}
+                    onChange={e => setEditingPub(p => ({ ...p, periodIndex: Number(e.target.value) }))}
+                    className="w-full text-xs p-2.5 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue bg-white disabled:bg-slate-50"
+                  >
+                    <option value={1}>P1: 1st – 15th of month</option>
+                    <option value={2}>P2: 16th – Month end</option>
+                  </select>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="block text-[10px] font-mono font-bold uppercase text-mut">Methodology Version</label>
+                  <input 
+                    type="text"
+                    disabled={isReadOnlyPublishedDaily}
+                    value={editingPub.methodologyVersion || 'Version 1.1'}
+                    onChange={e => setEditingPub(p => ({ ...p, methodologyVersion: e.target.value }))}
+                    placeholder="e.g. Version 1.1"
+                    className="w-full text-xs p-2.5 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue disabled:bg-slate-50"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="block text-[10px] font-mono font-bold uppercase text-mut">Publication Date</label>
+                  <input 
+                    type="text"
+                    disabled={isReadOnlyPublishedDaily}
+                    value={editingPub.publicationDate || ''}
+                    onChange={e => setEditingPub(p => ({ ...p, publicationDate: e.target.value }))}
+                    placeholder="e.g. 16 October 2026"
+                    className="w-full text-xs p-2.5 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue disabled:bg-slate-50"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="block text-[10px] font-mono font-bold uppercase text-mut">Evidence Cut-off Date</label>
+                  <input 
+                    type="text"
+                    disabled={isReadOnlyPublishedDaily}
+                    value={editingPub.evidenceCutoffDate || ''}
+                    onChange={e => setEditingPub(p => ({ ...p, evidenceCutoffDate: e.target.value }))}
+                    placeholder="e.g. 15 October 2026"
+                    className="w-full text-xs p-2.5 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue disabled:bg-slate-50"
+                  />
+                </div>
+
+                <div className="md:col-span-3 flex items-center gap-2 pt-1">
+                  <input 
+                    type="checkbox"
+                    id="isLatest"
+                    disabled={isReadOnlyPublishedDaily}
+                    checked={Boolean(editingPub.isLatest)}
+                    onChange={e => setEditingPub(p => ({ ...p, isLatest: e.target.checked }))}
+                    className="rounded text-brand-blue focus:ring-brand-blue w-4 h-4 cursor-pointer disabled:cursor-not-allowed"
+                  />
+                  <label htmlFor="isLatest" className="text-xs font-semibold text-ink cursor-pointer">
+                    Mark as Latest Publication (Default view for visitors at /democratic-competitiveness-map)
+                  </label>
+                </div>
+
+                <div className="md:col-span-3 space-y-1">
+                  <label className="block text-[10px] font-mono font-bold uppercase text-mut">Executive Summary / National Overview</label>
+                  <textarea 
+                    rows={3}
+                    disabled={isReadOnlyPublishedDaily}
+                    value={editingPub.summary || ''}
+                    onChange={e => setEditingPub(p => ({ ...p, summary: e.target.value }))}
+                    placeholder="Key national findings, regional deterioration, and contextual analysis..."
+                    className="w-full text-xs p-2.5 border border-line rounded-lg focus:outline-none focus:border-brand-blue disabled:bg-slate-50"
+                  />
+                </div>
+
+                <div className="md:col-span-3 space-y-1">
+                  <label className="block text-[10px] font-mono font-bold uppercase text-mut">Revision Notes / Methodology Changes (Optional)</label>
+                  <input 
+                    type="text"
+                    disabled={isReadOnlyPublishedDaily}
+                    value={editingPub.revisionNote || ''}
+                    onChange={e => setEditingPub(p => ({ ...p, revisionNote: e.target.value }))}
+                    placeholder="e.g. Initial baseline benchmark or updated evidence threshold..."
+                    className="w-full text-xs p-2.5 border border-line rounded-lg focus:outline-none focus:border-brand-blue disabled:bg-slate-50"
+                  />
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Section 2: Live Map Preview (if toggled) */}
           {showLivePreview && (
@@ -1115,8 +2120,9 @@ export const DcmCmsManager: React.FC = () => {
 
                 <button
                   type="button"
+                  disabled={isReadOnlyPublishedDaily || (isEditingDaily && Boolean(editingPub.isQuietDay))}
                   onClick={() => fileInputRef.current?.click()}
-                  className="px-3.5 py-2 rounded-xl bg-purple-50 hover:bg-purple-100 text-brand-purple text-xs font-mono font-bold flex items-center gap-1.5 border border-purple-200 transition-colors cursor-pointer shadow-xs"
+                  className="px-3.5 py-2 rounded-xl bg-purple-50 hover:bg-purple-100 disabled:opacity-50 text-brand-purple text-xs font-mono font-bold flex items-center gap-1.5 border border-purple-200 transition-colors cursor-pointer shadow-xs"
                   title="Upload CSV to populate all 37 jurisdictions"
                 >
                   <UploadCloud className="w-3.5 h-3.5 text-brand-purple" />
@@ -1135,6 +2141,30 @@ export const DcmCmsManager: React.FC = () => {
               </div>
             </div>
 
+            {/* Daily Carry-Forward Status Strip */}
+            {isEditingDaily && dailyDiff && (
+              <div className="p-3 rounded-xl bg-slate-50 border border-line flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
+                <div className="flex items-center gap-3 flex-wrap">
+                  <span className="text-slate-700">
+                    <strong>{dailyDiff.carriedForwardCount}</strong> Carried Forward
+                  </span>
+                  <span className="text-slate-400">·</span>
+                  <span className="text-indigo-700">
+                    <strong>{dailyDiff.updatedCount}</strong> Updated in This Draft
+                  </span>
+                  <span className="text-slate-400">·</span>
+                  <span className={dailyDiff.changedCodes.length > 0 ? 'text-amber-800 font-bold' : 'text-emerald-700'}>
+                    <strong>{dailyDiff.changedCodes.length}</strong> Classification Change{dailyDiff.changedCodes.length === 1 ? '' : 's'} vs Source
+                  </span>
+                </div>
+                {editingPub.isQuietDay && (
+                  <span className="text-teal-800 font-bold">
+                    Quiet-Day Lock Active (classifications unchanged)
+                  </span>
+                )}
+              </div>
+            )}
+
             {/* Classification Summary Statistics Banner */}
             <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 pt-1">
               {DCM_CLASSIFICATIONS.map(cls => {
@@ -1152,14 +2182,16 @@ export const DcmCmsManager: React.FC = () => {
                       <span className="text-xl font-display font-bold" style={{ color: conf.text }}>
                         {counts[cls]}
                       </span>
-                      <button
-                        type="button"
-                        onClick={() => handleBulkSetAll(cls)}
-                        className="text-[9px] font-mono underline hover:opacity-80 cursor-pointer"
-                        style={{ color: conf.text }}
-                      >
-                        Set all
-                      </button>
+                      {!isReadOnlyPublishedDaily && !(isEditingDaily && editingPub.isQuietDay) && (
+                        <button
+                          type="button"
+                          onClick={() => handleBulkSetAll(cls)}
+                          className="text-[9px] font-mono underline hover:opacity-80 cursor-pointer"
+                          style={{ color: conf.text }}
+                        >
+                          Set all
+                        </button>
+                      )}
                     </div>
                   </div>
                 );
@@ -1210,11 +2242,13 @@ export const DcmCmsManager: React.FC = () => {
                   <tr>
                     <th className="py-2.5 px-3">Code / State</th>
                     <th className="py-2.5 px-3">Geopolitical Zone</th>
+                    {isEditingDaily && <th className="py-2.5 px-3 min-w-[130px]">Basis</th>}
                     <th className="py-2.5 px-3 min-w-[170px]">Classification</th>
                     <th className="py-2.5 px-3 min-w-[150px]">Direction</th>
                     <th className="py-2.5 px-3 min-w-[110px]">Confidence</th>
                     <th className="py-2.5 px-3 min-w-[240px]">Key Finding / Rationale</th>
                     <th className="py-2.5 px-3 min-w-[160px]">Right of Response</th>
+                    {isEditingDaily && <th className="py-2.5 px-3 min-w-[140px]">Last Substantive Review</th>}
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-line">
@@ -1228,10 +2262,12 @@ export const DcmCmsManager: React.FC = () => {
                       keyFinding: '',
                       classificationRationale: '',
                       evidenceSummary: '',
-                      rightOfResponseStatus: 'Not required'
+                      rightOfResponseStatus: 'Not required',
+                      carriedForward: false
                     };
 
                     const colorConf = DCM_COLORS[rec.classification];
+                    const rowLocked = isReadOnlyPublishedDaily || (isEditingDaily && Boolean(editingPub.isQuietDay));
 
                     return (
                       <tr key={j.code} className="hover:bg-paper/60 transition-colors">
@@ -1248,11 +2284,38 @@ export const DcmCmsManager: React.FC = () => {
                           {j.zone}
                         </td>
 
+                        {isEditingDaily && (
+                          <td className="py-2 px-3 whitespace-nowrap">
+                            {rec.carriedForward ? (
+                              <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono font-semibold bg-slate-100 text-slate-700 border border-slate-200">
+                                Carried forward
+                              </span>
+                            ) : (
+                              <div className="flex items-center gap-1.5">
+                                <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-indigo-50 text-indigo-800 border border-indigo-200">
+                                  Updated
+                                </span>
+                                {!rowLocked && carryForwardSourcePub && (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleRevertStateToCarriedForward(j.code)}
+                                    className="text-[10px] font-mono text-mut hover:text-brand-blue underline cursor-pointer"
+                                    title="Restore carried-forward approved classification"
+                                  >
+                                    Revert
+                                  </button>
+                                )}
+                              </div>
+                            )}
+                          </td>
+                        )}
+
                         <td className="py-2 px-3">
                           <select 
+                            disabled={rowLocked}
                             value={rec.classification}
                             onChange={e => handleClassificationChange(j.code, e.target.value as DcmClassification)}
-                            className="w-full text-xs py-1.5 px-2 border rounded-lg font-semibold font-mono focus:outline-none"
+                            className="w-full text-xs py-1.5 px-2 border rounded-lg font-semibold font-mono focus:outline-none disabled:opacity-75 disabled:cursor-not-allowed"
                             style={{
                               borderColor: colorConf?.fill || '#CBD5E1',
                               backgroundColor: (colorConf?.fill || '#64748B') + '15',
@@ -1269,9 +2332,10 @@ export const DcmCmsManager: React.FC = () => {
 
                         <td className="py-2 px-3">
                           <select 
-                            value={rec.direction || (rec.classification === 'Insufficient evidence' ? 'insufficient-basis' : 'newly-classified')}
+                            disabled={rowLocked}
+                            value={rec.direction || (rec.classification === 'Insufficient evidence' ? 'insufficient-basis' : 'unchanged')}
                             onChange={e => handleStateFieldChange(j.code, 'direction', e.target.value)}
-                            className="w-full text-xs py-1.5 px-2 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue bg-white"
+                            className="w-full text-xs py-1.5 px-2 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue bg-white disabled:bg-slate-50"
                           >
                             {DCM_DIRECTIONS.map(d => (
                               <option key={d.value} value={d.value}>{d.label}</option>
@@ -1281,9 +2345,10 @@ export const DcmCmsManager: React.FC = () => {
 
                         <td className="py-2 px-3">
                           <select 
+                            disabled={rowLocked}
                             value={rec.confidence || (rec.classification === 'Insufficient evidence' ? 'Low' : 'Medium')}
                             onChange={e => handleStateFieldChange(j.code, 'confidence', e.target.value)}
-                            className="w-full text-xs py-1.5 px-2 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue bg-white"
+                            className="w-full text-xs py-1.5 px-2 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue bg-white disabled:bg-slate-50"
                           >
                             {DCM_CONFIDENCE_LEVELS.map(c => (
                               <option key={c} value={c}>{c}</option>
@@ -1294,32 +2359,208 @@ export const DcmCmsManager: React.FC = () => {
                         <td className="py-2 px-3">
                           <input 
                             type="text"
+                            disabled={rowLocked}
                             value={rec.keyFinding || rec.classificationRationale || ''}
                             onChange={e => {
                               handleStateFieldChange(j.code, 'keyFinding', e.target.value);
                               handleStateFieldChange(j.code, 'classificationRationale', e.target.value);
                             }}
                             placeholder="Key finding or decision rationale..."
-                            className="w-full text-xs p-1.5 border border-line rounded-lg focus:outline-none focus:border-brand-blue bg-white"
+                            className="w-full text-xs p-1.5 border border-line rounded-lg focus:outline-none focus:border-brand-blue bg-white disabled:bg-slate-50"
                           />
                         </td>
 
                         <td className="py-2 px-3">
                           <select 
+                            disabled={rowLocked}
                             value={rec.rightOfResponseStatus || 'Not required'}
                             onChange={e => handleStateFieldChange(j.code, 'rightOfResponseStatus', e.target.value)}
-                            className="w-full text-[11px] p-1.5 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue bg-white"
+                            className="w-full text-[11px] p-1.5 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue bg-white disabled:bg-slate-50"
                           >
                             {RIGHT_OF_RESPONSE_OPTIONS.map(opt => (
                               <option key={opt} value={opt}>{opt}</option>
                             ))}
                           </select>
                         </td>
+
+                        {isEditingDaily && (
+                          <td className="py-2 px-3">
+                            <input
+                              type="date"
+                              disabled={isReadOnlyPublishedDaily}
+                              value={rec.lastSubstantiveReviewDate || ''}
+                              onChange={e => handleStateFieldChange(j.code, 'lastSubstantiveReviewDate', e.target.value)}
+                              title="Date of last substantive state review (only enter where supplied by Research)"
+                              className="w-full text-[11px] p-1.5 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue bg-white disabled:bg-slate-50"
+                            />
+                          </td>
+                        )}
                       </tr>
                     );
                   })}
                 </tbody>
               </table>
+            </div>
+
+            {/* Section 4: Pre-Release Consistency Checks & Research Approval Gate (Applies to Daily & Legacy Releases) */}
+            <div className="bg-slate-50 border border-indigo-200 rounded-xl p-5 space-y-4">
+              <div className="flex items-center justify-between flex-wrap gap-2 border-b border-indigo-100 pb-3">
+                <div className="flex items-center gap-2">
+                  <ShieldCheck className="w-5 h-5 text-indigo-700" />
+                  <h4 className="font-display font-bold text-sm text-ink uppercase tracking-wider">
+                    Pre-Release Consistency Check &amp; Research Approval Gate
+                  </h4>
+                </div>
+                <span className="text-[11px] font-mono text-indigo-800">
+                  Documented Research approval reference &amp; signed-in admin record required to publish
+                </span>
+              </div>
+
+              {/* Review Summary Grid */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+                <div className="bg-white border border-line rounded-lg p-3 space-y-0.5">
+                  <div className="text-[10px] font-mono uppercase text-mut">
+                    {isEditingDaily ? 'Assessment Date' : 'Reporting Period'}
+                  </div>
+                  <div className="font-bold text-ink">
+                    {isEditingDaily
+                      ? (editingPub.assessmentDate ? formatDailyDateLabel(editingPub.assessmentDate) : 'Not set')
+                      : (editingPub.reportingPeriodLabel || 'Not set')}
+                  </div>
+                </div>
+                <div className="bg-white border border-line rounded-lg p-3 space-y-0.5">
+                  <div className="text-[10px] font-mono uppercase text-mut">
+                    {isEditingDaily ? 'Evidence Cut-Off (WAT)' : 'Evidence Cut-Off'}
+                  </div>
+                  <div className="font-bold text-indigo-800">
+                    {isEditingDaily
+                      ? (dailyWatPreview?.valid ? dailyWatPreview.displayLabel : 'Invalid / Missing')
+                      : (editingPub.evidenceCutoffDate || 'Not set')}
+                  </div>
+                </div>
+                <div className="bg-white border border-line rounded-lg p-3 space-y-0.5">
+                  <div className="text-[10px] font-mono uppercase text-mut">Consistency Audit</div>
+                  <div className={`font-bold ${liveConsistencyAudit?.consistent ? 'text-emerald-700' : 'text-red-700'}`}>
+                    {liveConsistencyAudit?.consistent
+                      ? `${liveConsistencyAudit.stats.classifiedCount}/37 Verified · Map/Card Parity OK`
+                      : `${liveConsistencyAudit?.errors.length || 0} consistency error(s)`}
+                  </div>
+                </div>
+                <div className="bg-white border border-line rounded-lg p-3 space-y-0.5">
+                  <div className="text-[10px] font-mono uppercase text-mut">Approved Summary</div>
+                  <div className={`font-bold ${(editingPub.summary || '').trim().length >= 10 ? 'text-emerald-700' : 'text-amber-700'}`}>
+                    {(editingPub.summary || '').trim().length >= 10 ? 'Entered (Ready for review)' : 'Missing / Too short'}
+                  </div>
+                </div>
+              </div>
+
+              {/* Transparent Missing-Evidence Audit Note */}
+              {liveConsistencyAudit && liveConsistencyAudit.warnings.length > 0 && (
+                <div className="bg-amber-50/80 border border-amber-200 rounded-lg p-3 text-[11px] text-amber-900 space-y-1">
+                  <div className="font-mono font-bold uppercase tracking-wider text-amber-800">
+                    Public Evidence Transparency Notice
+                  </div>
+                  {liveConsistencyAudit.warnings.map((w, idx) => (
+                    <p key={idx} className="leading-relaxed">{w}</p>
+                  ))}
+                </div>
+              )}
+
+              {/* Explicit Non-Verification Disclosure */}
+              <div className="bg-indigo-50/70 border border-indigo-200 rounded-lg p-3 text-[11px] text-indigo-950 flex items-start gap-2">
+                <Info className="w-4 h-4 text-indigo-700 shrink-0 mt-0.5" />
+                <div className="space-y-0.5 leading-relaxed">
+                  <p>
+                    <strong>Administrative record notice:</strong> Entering a Research approver name is an administrative record only and is <strong>not</strong> independent verification that Research approval occurred. A documented Research approval reference (e.g. memo, email log, or sign-off ticket ID) is mandatory prior to publication.
+                  </p>
+                  <p className="font-mono text-[10px] text-indigo-800">
+                    Recording Administrator Identity:{' '}
+                    <strong>{auth.currentUser?.email || auth.currentUser?.uid || 'Not signed in'}</strong>
+                    {' '}· Timestamp stamped automatically on save.
+                  </p>
+                </div>
+              </div>
+
+              {/* Approval Record Form */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-1">
+                <div className="space-y-1">
+                  <label className="block text-[10px] font-mono font-bold uppercase text-mut">
+                    Documented Research Approval Reference <span className="text-red-600">* (Required to Approve / Publish)</span>
+                  </label>
+                  <input
+                    type="text"
+                    disabled={isReadOnlyPublishedDaily}
+                    value={approvalReference}
+                    onChange={e => setApprovalReference(e.target.value)}
+                    placeholder="e.g. AEO-RES-2026-11-19 or Memo/Sign-Off ID"
+                    className="w-full text-xs p-2.5 border border-line rounded-lg bg-white font-mono focus:outline-none focus:border-brand-blue disabled:bg-slate-100"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <label className="block text-[10px] font-mono font-bold uppercase text-mut">
+                    Recorded Research Approver Name <span className="text-red-600">* (Administrative Record)</span>
+                  </label>
+                  <input
+                    type="text"
+                    disabled={isReadOnlyPublishedDaily}
+                    value={approverName}
+                    onChange={e => setApproverName(e.target.value)}
+                    placeholder="e.g. Dr. Amina Bello — Head of Research"
+                    className="w-full text-xs p-2.5 border border-line rounded-lg bg-white focus:outline-none focus:border-brand-blue disabled:bg-slate-100"
+                  />
+                </div>
+              </div>
+
+              <div className="flex items-start gap-2.5 pt-1">
+                <input
+                  type="checkbox"
+                  id="dcm-research-approval-confirm"
+                  disabled={isReadOnlyPublishedDaily}
+                  checked={approvalConfirmed}
+                  onChange={e => setApprovalConfirmed(e.target.checked)}
+                  className="rounded text-indigo-700 focus:ring-indigo-600 w-4 h-4 mt-0.5 cursor-pointer disabled:cursor-not-allowed"
+                />
+                <label htmlFor="dcm-research-approval-confirm" className="text-xs text-ink cursor-pointer">
+                  <span className="font-bold">Record Documented Research Approval</span>
+                  <span className="block text-[11px] text-mut mt-0.5">
+                    I confirm that this publication summary, evidence cut-off, and all 37 state classifications match the documented Research approval reference above. My administrator UID and timestamp will be stored with this record, and once published it will be locked against overwrite or deletion.
+                  </span>
+                </label>
+              </div>
+
+              {isEditingDaily && !isReadOnlyPublishedDaily && (
+                <div className="flex items-center justify-end gap-2.5 flex-wrap pt-2 border-t border-indigo-100">
+                  <button
+                    type="button"
+                    disabled={isSaving}
+                    onClick={() => handleSaveDaily('draft')}
+                    className="px-4 py-2 rounded-xl text-xs font-mono font-bold uppercase tracking-wider bg-white hover:bg-slate-100 text-ink border border-slate-300 flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  >
+                    <Save className="w-3.5 h-3.5" />
+                    <span>Save Draft</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={isSaving || !approvalConfirmed || approverName.trim().length < 2 || approvalReference.trim().length < 3}
+                    onClick={() => handleSaveDaily('approved')}
+                    className="px-4 py-2 rounded-xl text-xs font-mono font-bold uppercase tracking-wider bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white flex items-center gap-1.5 cursor-pointer disabled:cursor-not-allowed"
+                  >
+                    <FileCheck2 className="w-3.5 h-3.5" />
+                    <span>Save as Approved</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={isSaving || !approvalConfirmed || approverName.trim().length < 2 || approvalReference.trim().length < 3}
+                    onClick={() => handleSaveDaily('published')}
+                    className="px-5 py-2 rounded-xl text-xs font-mono font-bold uppercase tracking-wider bg-brand-green hover:bg-emerald-700 disabled:opacity-40 text-white shadow-sm flex items-center gap-1.5 cursor-pointer disabled:cursor-not-allowed"
+                  >
+                    <Send className="w-3.5 h-3.5" />
+                    <span>{isSaving ? 'Publishing...' : 'Publish Daily Update'}</span>
+                  </button>
+                </div>
+              )}
             </div>
 
             {/* Bottom Actions Bar */}
@@ -1334,16 +2575,19 @@ export const DcmCmsManager: React.FC = () => {
                   onClick={handleCancel}
                   className="px-4 py-2 text-xs font-mono font-semibold text-mut hover:text-ink cursor-pointer"
                 >
-                  Cancel
+                  {isReadOnlyPublishedDaily ? 'Close' : 'Cancel'}
                 </button>
-                <button
-                  type="button"
-                  onClick={handleSave}
-                  className="px-6 py-2 rounded-xl text-xs font-mono font-bold uppercase tracking-wider bg-brand-green hover:bg-emerald-700 text-white shadow-sm flex items-center gap-2 cursor-pointer transition-all"
-                >
-                  <Save className="w-4 h-4" />
-                  <span>Save Publication</span>
-                </button>
+                {!isEditingDaily && !isReadOnlyPublishedDaily && (
+                  <button
+                    type="button"
+                    disabled={isSaving}
+                    onClick={handleSave}
+                    className="px-6 py-2 rounded-xl text-xs font-mono font-bold uppercase tracking-wider bg-brand-green hover:bg-emerald-700 disabled:opacity-50 text-white shadow-sm flex items-center gap-2 cursor-pointer transition-all"
+                  >
+                    <Save className="w-4 h-4" />
+                    <span>{isSaving ? 'Saving...' : 'Save Publication'}</span>
+                  </button>
+                )}
               </div>
             </div>
 

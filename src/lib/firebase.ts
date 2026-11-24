@@ -3,16 +3,35 @@ import { getAuth, GoogleAuthProvider } from 'firebase/auth';
 import { getFirestore, initializeFirestore, doc, getDocFromServer } from 'firebase/firestore';
 import firebaseAppletConfig from '../../firebase-applet-config.json';
 
+const PRODUCTION_PROJECT_ID = 'gen-lang-client-0961551337';
+const PRODUCTION_DATABASE_ID = 'aeo-database19';
+
+const viteEnv: Record<string, string | undefined> =
+  typeof import.meta !== 'undefined' && (import.meta as any).env
+    ? ((import.meta as any).env as Record<string, string | undefined>)
+    : {};
+
+const isStagingRuntime = (viteEnv.VITE_APP_ENV || '').trim().toLowerCase() === 'staging';
+
 const firebaseConfig = {
-  apiKey: firebaseAppletConfig.apiKey || "AIzaSyBCNwTlYqScaD3o_FFycpX6u-M7PCXysc0",
-  authDomain: firebaseAppletConfig.authDomain || "gen-lang-client-0961551337.firebaseapp.com",
-  projectId: firebaseAppletConfig.projectId || "gen-lang-client-0961551337",
-  storageBucket: firebaseAppletConfig.storageBucket || "gen-lang-client-0961551337.firebasestorage.app",
-  messagingSenderId: firebaseAppletConfig.messagingSenderId || "442919512066",
-  appId: firebaseAppletConfig.appId || "1:442919512066:web:2ca4cdb492eeba1ad49f1b"
+  apiKey: viteEnv.VITE_FIREBASE_API_KEY || firebaseAppletConfig.apiKey || '',
+  authDomain: viteEnv.VITE_FIREBASE_AUTH_DOMAIN || firebaseAppletConfig.authDomain || '',
+  projectId: viteEnv.VITE_FIREBASE_PROJECT_ID || firebaseAppletConfig.projectId || '',
+  storageBucket: viteEnv.VITE_FIREBASE_STORAGE_BUCKET || firebaseAppletConfig.storageBucket || '',
+  messagingSenderId: viteEnv.VITE_FIREBASE_MESSAGING_SENDER_ID || firebaseAppletConfig.messagingSenderId || '',
+  appId: viteEnv.VITE_FIREBASE_APP_ID || firebaseAppletConfig.appId || ''
 };
 
-const databaseId = firebaseAppletConfig.firestoreDatabaseId || "aeo-database19";
+const databaseId = viteEnv.VITE_FIREBASE_DATABASE_ID || firebaseAppletConfig.firestoreDatabaseId || '(default)';
+
+if (
+  isStagingRuntime &&
+  (firebaseConfig.projectId === PRODUCTION_PROJECT_ID || databaseId === PRODUCTION_DATABASE_ID)
+) {
+  throw new Error(
+    `STAGING ISOLATION VIOLATION: VITE_APP_ENV=staging cannot connect to Production Firebase project (${PRODUCTION_PROJECT_ID}) or database (${PRODUCTION_DATABASE_ID}). Configure dedicated VITE_FIREBASE_* staging credentials before running.`
+  );
+}
 
 const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
