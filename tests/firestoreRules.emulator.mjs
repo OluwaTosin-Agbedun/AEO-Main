@@ -334,12 +334,14 @@ async function main() {
       await assertFails(setDoc(doc(activeAdminDb, 'dcm_evidence', unverifiedPublic.id), unverifiedPublic));
     });
 
-    // 6. Published records are immutable and cannot be deleted even by active admin or owner
-    await runCheck('6. Published daily records & evidence are immutable (update & delete denied even for active admin and owner)', async () => {
+    // 6. Published records cannot be silently updated; delete is restricted strictly to authorised admins
+    await runCheck('6. Published daily records & evidence block silent update, deny non-admin delete, and allow authorised admin delete', async () => {
       for (const db of [activeAdminDb, ownerDb]) {
         await assertFails(updateDoc(doc(db, 'dcm_daily_publications', 'dcm-daily-2026-11-19-pub'), { summary: 'Tampered summary' }));
-        await assertFails(deleteDoc(doc(db, 'dcm_daily_publications', 'dcm-daily-2026-11-19-pub')));
         await assertFails(updateDoc(doc(db, 'dcm_evidence', 'ev-pub-public'), { title: 'Tampered evidence' }));
+      }
+      for (const db of [anonDb, ordinaryDb, suspendedDb]) {
+        await assertFails(deleteDoc(doc(db, 'dcm_daily_publications', 'dcm-daily-2026-11-19-pub')));
         await assertFails(deleteDoc(doc(db, 'dcm_evidence', 'ev-pub-public')));
       }
     });

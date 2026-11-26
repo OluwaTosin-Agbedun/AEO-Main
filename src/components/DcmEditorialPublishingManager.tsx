@@ -701,14 +701,11 @@ ${activeExtract.html}
 
               <div className="bg-paper border border-line rounded-xl p-3 space-y-1">
                 <span className="text-[10px] font-mono uppercase tracking-wider text-mut">
-                  Publication &amp; WAT Cut-off
+                  Publication
                 </span>
                 <p className="text-xs font-semibold text-ink">{canonicalSource.periodLabel}</p>
                 <p className="text-[11px] font-mono text-slate-600 break-all">
                   ID: {canonicalSource.publicationId}
-                </p>
-                <p className="text-[11px] text-slate-600">
-                  Cut-off: {canonicalSource.evidenceCutoffWatLabel}
                 </p>
               </div>
 
@@ -805,10 +802,9 @@ ${activeExtract.html}
                 {activeExportType === 'newsletter-dcw' && newsletterExtract && (
                   <dl className="space-y-2.5 text-xs">
                     <div>
-                      <dt className="font-mono text-[10px] uppercase text-mut">Publication Date &amp; WAT Cut-off</dt>
+                      <dt className="font-mono text-[10px] uppercase text-mut">Publication Date</dt>
                       <dd className="text-ink font-medium">
-                        {newsletterExtract.structured.publicationDate} ({newsletterExtract.structured.assessmentDateIso}) ·{' '}
-                        {newsletterExtract.structured.watEvidenceCutoff}
+                        {newsletterExtract.structured.publicationDate} ({newsletterExtract.structured.assessmentDateIso})
                       </dd>
                     </div>
                     <div>
@@ -932,10 +928,9 @@ ${activeExtract.html}
                       <dd className="text-ink font-semibold">{websiteExtract.structured.heading}</dd>
                     </div>
                     <div>
-                      <dt className="font-mono text-[10px] uppercase text-mut">Edition Date &amp; Cut-off</dt>
+                      <dt className="font-mono text-[10px] uppercase text-mut">Edition Date</dt>
                       <dd className="text-slate-800">
-                        {websiteExtract.structured.publicationDateLabel} ({websiteExtract.structured.assessmentDateIso}) ·{' '}
-                        {websiteExtract.structured.evidenceCutoffWatLabel}
+                        {websiteExtract.structured.publicationDateLabel} ({websiteExtract.structured.assessmentDateIso})
                       </dd>
                     </div>
                     <div>

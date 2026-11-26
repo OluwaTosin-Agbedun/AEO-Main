@@ -32,10 +32,10 @@ export const DCM_DIRECTIONS: { value: DcmDirection; label: string }[] = [
 
 export interface DcmApprovalRecord {
   approved: boolean;
-  /** Documented Research approval reference (e.g. memo/sign-off reference such as AEO-RES-2026-11-19). Required before release. */
-  approvalReference: string;
-  /** Recorded Research approver name (administrative record only; does NOT constitute independent verification that approval occurred). */
-  approvedByName: string;
+  /** Optional Research approval reference (e.g. memo/sign-off reference such as AEO-RES-2026-11-19). */
+  approvalReference?: string;
+  /** Optional Research approver name (administrative record only). */
+  approvedByName?: string;
   /** ISO 8601 timestamp when Research approval was granted. */
   approvedAt: string;
   /** Authenticated CMS administrator UID who recorded this approval in the CMS. */

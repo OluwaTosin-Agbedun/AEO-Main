@@ -579,7 +579,7 @@ export const DcmMap: React.FC<DcmMapProps> = ({
 
               <div className="mt-3 pt-2.5 border-t border-slate-100 text-[11px] text-slate-500 leading-normal">
                 <div>AEO Democratic Competitiveness Map (DCM)</div>
-                <div>{pubMeta.isDaily ? `Evidence cut-off: ${pubMeta.evidenceCutoffLabel}` : `Updated: ${pubMeta.evidenceCutoffLabel}`}</div>
+                <div>As of {pubMeta.periodLabel}</div>
               </div>
             </div>
           );

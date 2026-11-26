@@ -766,14 +766,24 @@ async function runTests() {
         status: 'published'
       }
     });
-    expectRule('Admin DENIED PUBLISH evidence without approvalReference', false, {
+    expectRule('Admin ALLOWED PUBLISH evidence with optional approvalReference & approvedByName blank', true, {
       operation: 'create',
       path: 'dcm_evidence/ev-no-ref',
       auth: adminAuth,
       incomingData: {
         ...publicPublishedEv,
         id: 'ev-no-ref',
-        approvalRecord: { ...makeApproval('AEO-REF'), approvalReference: '' }
+        approvalRecord: { ...makeApproval('AEO-REF'), approvalReference: '', approvedByName: '' }
+      }
+    });
+    expectRule('Admin DENIED PUBLISH evidence without approvalRecord', false, {
+      operation: 'create',
+      path: 'dcm_evidence/ev-no-approval',
+      auth: adminAuth,
+      incomingData: {
+        ...publicPublishedEv,
+        id: 'ev-no-approval',
+        approvalRecord: undefined
       }
     });
     expectRule('Admin DENIED PUBLISH evidence with spoofed recordedByUid', false, {
@@ -794,10 +804,15 @@ async function runTests() {
       auth: adminAuth,
       incomingData: { ...publicPublishedEv, title: 'Mutated title' }
     });
-    expectRule('Admin DENIED DELETE published evidence', false, {
+    expectRule('Admin ALLOWED DELETE erroneous published evidence', true, {
       operation: 'delete',
       path: `dcm_evidence/${publicPublishedEv.id}`,
       auth: adminAuth
+    });
+    expectRule('Public DENIED DELETE published evidence', false, {
+      operation: 'delete',
+      path: `dcm_evidence/${publicPublishedEv.id}`,
+      auth: null
     });
     expectRule('Admin DENIED UPDATE published incident', false, {
       operation: 'update',
@@ -805,10 +820,15 @@ async function runTests() {
       auth: adminAuth,
       incomingData: { ...publicPublishedInc, title: 'Mutated incident' }
     });
-    expectRule('Admin DENIED DELETE published incident', false, {
+    expectRule('Admin ALLOWED DELETE erroneous published incident', true, {
       operation: 'delete',
       path: `dcm_incidents/${publicPublishedInc.id}`,
       auth: adminAuth
+    });
+    expectRule('Public DENIED DELETE published incident', false, {
+      operation: 'delete',
+      path: `dcm_incidents/${publicPublishedInc.id}`,
+      auth: null
     });
     expectRule('Admin DENIED UPDATE published development', false, {
       operation: 'update',
@@ -816,10 +836,15 @@ async function runTests() {
       auth: adminAuth,
       incomingData: { ...publicPublishedDev, title: 'Mutated dev' }
     });
-    expectRule('Admin DENIED DELETE published development', false, {
+    expectRule('Admin ALLOWED DELETE erroneous published development', true, {
       operation: 'delete',
       path: `dcm_incident_developments/${publicPublishedDev.id}`,
       auth: adminAuth
+    });
+    expectRule('Public DENIED DELETE published development', false, {
+      operation: 'delete',
+      path: `dcm_incident_developments/${publicPublishedDev.id}`,
+      auth: null
     });
 
     // --- Valid admin creates & updates (drafts, versioned -r2 corrections, private notes) ---

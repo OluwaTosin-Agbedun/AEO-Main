@@ -112,10 +112,8 @@ function getNextRevisionNumber(currentRevision: number | undefined, newId: strin
 
 function hasValidPublicApproval(approval: DcmApprovalRecord | undefined): boolean {
   if (!approval || approval.approved !== true) return false;
-  const ref = (approval.approvalReference || '').trim();
-  const approver = (approval.approvedByName || '').trim();
   const recorder = (approval.recordedByUid || approval.approvedByUid || '').trim();
-  return ref.length >= 3 && approver.length >= 2 && recorder.length > 0;
+  return recorder.length > 0;
 }
 
 /**

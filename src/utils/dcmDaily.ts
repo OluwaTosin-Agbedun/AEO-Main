@@ -521,15 +521,13 @@ export function validateApprovalRecord(
   }
 
   const ref = (approval.approvalReference || '').trim();
-  if (ref.length < 3 || ref.length > 128) {
-    errors.push(
-      'A documented Research approval reference (e.g. memo or sign-off ID, 3–128 characters) is required before publication. A manually typed approver name alone is not independent verification.'
-    );
+  if (ref.length > 128) {
+    errors.push('Research approval reference must be 128 characters or fewer.');
   }
 
   const approverName = (approval.approvedByName || '').trim();
-  if (approverName.length < 2 || approverName.length > 128) {
-    errors.push('Recorded Research approver name (2–128 characters) is required.');
+  if (approverName.length > 128) {
+    errors.push('Recorded Research approver name must be 128 characters or fewer.');
   }
 
   if (!approval.approvedAt || Number.isNaN(new Date(approval.approvedAt).getTime())) {

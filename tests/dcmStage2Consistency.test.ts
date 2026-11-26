@@ -442,21 +442,34 @@ async function main() {
         createdByUid: OWNER_UID
       });
 
-      // 7a. Manually typed approver name WITHOUT documented approvalReference or recorder identity MUST be rejected
-      const typedNameOnlyErrors = validateApprovalRecord(
+      // 7a. Approval without authenticated recorder identity or timestamp MUST still be rejected,
+      // while optional approvalReference and approvedByName may be omitted when recorder identity is valid
+      const missingRecorderErrors = validateApprovalRecord(
         {
           approved: true,
           approvalReference: '',
-          approvedByName: 'Manually Typed Approver',
+          approvedByName: '',
           approvedAt: '2026-11-22T16:00:00Z',
           recordedByUid: '',
           recordedAt: ''
         },
         OWNER_UID
       );
-      assert.ok(typedNameOnlyErrors.length > 0);
-      assert.ok(typedNameOnlyErrors.some((e) => e.toLowerCase().includes('reference')));
-      assert.ok(typedNameOnlyErrors.some((e) => e.toLowerCase().includes('uid') || e.toLowerCase().includes('identity')));
+      assert.ok(missingRecorderErrors.length > 0);
+      assert.ok(missingRecorderErrors.some((e) => e.toLowerCase().includes('uid') || e.toLowerCase().includes('identity')));
+
+      const optionalFieldsValidErrors = validateApprovalRecord(
+        {
+          approved: true,
+          approvalReference: '',
+          approvedByName: '',
+          approvedAt: '2026-11-22T16:00:00Z',
+          recordedByUid: OWNER_UID,
+          recordedAt: '2026-11-22T16:05:00Z'
+        },
+        OWNER_UID
+      );
+      assert.equal(optionalFieldsValidErrors.length, 0);
 
       // 7b. Mismatched actorUid (attempting to forge recordedByUid of another admin) MUST be rejected
       const spoofedRecorderErrors = validateApprovalRecord(
@@ -781,7 +794,7 @@ async function main() {
           expected: true
         },
         {
-          label: 'Active admin PUBLISH without approvalReference (DENY)',
+          label: 'Active admin PUBLISH with optional approvalReference & approvedByName omitted (ALLOW)',
           actual: evaluateFirestoreRequest(ruleset, store, {
             operation: 'update',
             path: `dcm_daily_publications/${draftDoc.id}`,
@@ -790,10 +803,33 @@ async function main() {
               ...draftDoc,
               status: 'published',
               publishedAt: '2026-11-19T16:30:00.000Z',
-              summary: 'Attempting publish with typed name only and no approvalReference.',
+              summary: 'Research-approved daily assessment published with optional metadata omitted.',
               approvalRecord: {
                 approved: true,
-                approvedByName: 'Manually Typed Name',
+                approvalReference: '',
+                approvedByName: '',
+                approvedAt: '2026-11-19T16:10:00.000Z',
+                recordedByUid: ACTIVE_ADMIN_UID,
+                recordedAt: '2026-11-19T16:12:00.000Z'
+              }
+            }
+          }).allowed,
+          expected: true
+        },
+        {
+          label: 'Active admin PUBLISH with oversized approvalReference > 128 chars (DENY)',
+          actual: evaluateFirestoreRequest(ruleset, store, {
+            operation: 'update',
+            path: `dcm_daily_publications/${draftDoc.id}`,
+            auth: { uid: ACTIVE_ADMIN_UID },
+            incomingData: {
+              ...draftDoc,
+              status: 'published',
+              publishedAt: '2026-11-19T16:30:00.000Z',
+              summary: 'Attempting publish with oversized approvalReference.',
+              approvalRecord: {
+                approved: true,
+                approvalReference: 'X'.repeat(129),
                 approvedAt: '2026-11-19T16:10:00.000Z',
                 recordedByUid: ACTIVE_ADMIN_UID,
                 recordedAt: '2026-11-19T16:12:00.000Z'
@@ -872,11 +908,47 @@ async function main() {
           expected: false
         },
         {
-          label: 'Owner DELETE published daily doc (DENY)',
+          label: 'Owner DELETE erroneous published daily doc (ALLOW)',
           actual: evaluateFirestoreRequest(ruleset, store, {
             operation: 'delete',
             path: `dcm_daily_publications/${publishedDoc.id}`,
             auth: { uid: OWNER_UID }
+          }).allowed,
+          expected: true
+        },
+        {
+          label: 'Active admin DELETE erroneous published daily doc (ALLOW)',
+          actual: evaluateFirestoreRequest(ruleset, store, {
+            operation: 'delete',
+            path: `dcm_daily_publications/${publishedDoc.id}`,
+            auth: { uid: ACTIVE_ADMIN_UID }
+          }).allowed,
+          expected: true
+        },
+        {
+          label: 'Unauthenticated DELETE published daily doc (DENY)',
+          actual: evaluateFirestoreRequest(ruleset, store, {
+            operation: 'delete',
+            path: `dcm_daily_publications/${publishedDoc.id}`,
+            auth: null
+          }).allowed,
+          expected: false
+        },
+        {
+          label: 'Non-admin DELETE published daily doc (DENY)',
+          actual: evaluateFirestoreRequest(ruleset, store, {
+            operation: 'delete',
+            path: `dcm_daily_publications/${publishedDoc.id}`,
+            auth: { uid: PUBLIC_SIGNED_IN_UID }
+          }).allowed,
+          expected: false
+        },
+        {
+          label: 'Suspended admin DELETE published daily doc (DENY)',
+          actual: evaluateFirestoreRequest(ruleset, store, {
+            operation: 'delete',
+            path: `dcm_daily_publications/${publishedDoc.id}`,
+            auth: { uid: SUSPENDED_ADMIN_UID }
           }).allowed,
           expected: false
         },

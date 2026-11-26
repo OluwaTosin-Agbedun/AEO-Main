@@ -124,6 +124,14 @@ export const DcmEvidenceCmsManager: React.FC<DcmEvidenceCmsManagerProps> = ({ mo
   const [noteContacts, setNoteContacts] = useState<string>('');
   const [noteLeads, setNoteLeads] = useState<string>('');
   const [savingNote, setSavingNote] = useState<boolean>(false);
+  const [deleteConfirmTarget, setDeleteConfirmTarget] = useState<{
+    kind: 'evidence' | 'incident' | 'development';
+    id: string;
+    title: string;
+    isPublished: boolean;
+  } | null>(null);
+  const [confirmPublishedDelete, setConfirmPublishedDelete] = useState<boolean>(false);
+  const [isDeletingRecord, setIsDeletingRecord] = useState<boolean>(false);
 
   const showBanner = (text: string, type: 'success' | 'error' = 'success') => {
     setStatusBanner({ text, type });
@@ -140,7 +148,7 @@ export const DcmEvidenceCmsManager: React.FC<DcmEvidenceCmsManagerProps> = ({ mo
     const currentUid = auth.currentUser?.uid || '';
     const currentEmail = auth.currentUser?.email || undefined;
     const nowIso = new Date().toISOString();
-    if (!approvalConfirmed || approverName.trim().length < 2 || approvalRef.trim().length < 3) {
+    if (!approvalConfirmed) {
       return undefined;
     }
     return {
@@ -413,16 +421,51 @@ export const DcmEvidenceCmsManager: React.FC<DcmEvidenceCmsManagerProps> = ({ mo
     }
   };
 
-  const handleDeleteEvidenceAction = async (ev: DcmEvidenceRecord) => {
-    if (ev.status === 'published') {
-      showBanner('Published evidence records are immutable and cannot be deleted. Issue a corrected revision instead.', 'error');
-      return;
-    }
+  const handleDeleteEvidenceAction = (ev: DcmEvidenceRecord) => {
+    setDeleteConfirmTarget({
+      kind: 'evidence',
+      id: ev.id,
+      title: ev.title,
+      isPublished: ev.status === 'published'
+    });
+    setConfirmPublishedDelete(false);
+  };
+
+  const handleConfirmDeleteRecord = async () => {
+    if (!deleteConfirmTarget || isDeletingRecord) return;
+    if (deleteConfirmTarget.isPublished && !confirmPublishedDelete) return;
+
+    const target = deleteConfirmTarget;
+    setIsDeletingRecord(true);
     try {
-      await deleteDcmEvidence(ev.id);
-      showBanner(`Deleted unpublished evidence draft "${ev.id}".`);
+      if (target.kind === 'evidence') {
+        await deleteDcmEvidence(target.id);
+        if (editingEvidenceExistingId === target.id) {
+          setEditingEvidence(null);
+          setEditingEvidenceExistingId(null);
+        }
+        showBanner(`Deleted evidence record "${target.id}".`);
+      } else if (target.kind === 'incident') {
+        await deleteDcmIncident(target.id);
+        if (editingIncidentExistingId === target.id) {
+          setEditingIncident(null);
+          setEditingIncidentExistingId(null);
+        }
+        showBanner(`Deleted incident record "${target.id}".`);
+      } else {
+        await deleteDcmIncidentDevelopment(target.id);
+        if (editingDevExistingId === target.id) {
+          setEditingDev(null);
+          setEditingDevExistingId(null);
+        }
+        showBanner(`Deleted incident development "${target.id}".`);
+      }
+      setDeleteConfirmTarget(null);
+      setConfirmPublishedDelete(false);
     } catch (err: any) {
-      showBanner(`Failed to delete evidence record: ${err.message}`, 'error');
+      showBanner(`Failed to delete ${target.kind}: ${err.message}`, 'error');
+    } finally {
+      setIsDeletingRecord(false);
     }
   };
 
@@ -559,17 +602,14 @@ export const DcmEvidenceCmsManager: React.FC<DcmEvidenceCmsManagerProps> = ({ mo
     }
   };
 
-  const handleDeleteIncidentAction = async (inc: DcmIncidentRecord) => {
-    if (inc.status === 'published') {
-      showBanner('Published incident records are immutable and cannot be deleted.', 'error');
-      return;
-    }
-    try {
-      await deleteDcmIncident(inc.id);
-      showBanner(`Deleted unpublished incident draft "${inc.id}".`);
-    } catch (err: any) {
-      showBanner(`Failed to delete incident: ${err.message}`, 'error');
-    }
+  const handleDeleteIncidentAction = (inc: DcmIncidentRecord) => {
+    setDeleteConfirmTarget({
+      kind: 'incident',
+      id: inc.id,
+      title: inc.title,
+      isPublished: inc.status === 'published'
+    });
+    setConfirmPublishedDelete(false);
   };
 
   // Developments under an Incident ID
@@ -706,17 +746,14 @@ export const DcmEvidenceCmsManager: React.FC<DcmEvidenceCmsManagerProps> = ({ mo
     }
   };
 
-  const handleDeleteDevelopmentAction = async (dev: DcmIncidentDevelopment) => {
-    if (dev.status === 'published') {
-      showBanner('Published incident developments are immutable and cannot be deleted.', 'error');
-      return;
-    }
-    try {
-      await deleteDcmIncidentDevelopment(dev.id);
-      showBanner(`Deleted unpublished development draft "${dev.id}".`);
-    } catch (err: any) {
-      showBanner(`Failed to delete development: ${err.message}`, 'error');
-    }
+  const handleDeleteDevelopmentAction = (dev: DcmIncidentDevelopment) => {
+    setDeleteConfirmTarget({
+      kind: 'development',
+      id: dev.id,
+      title: dev.title,
+      isPublished: dev.status === 'published'
+    });
+    setConfirmPublishedDelete(false);
   };
 
   // Helper to toggle linked publication IDs
@@ -740,7 +777,7 @@ export const DcmEvidenceCmsManager: React.FC<DcmEvidenceCmsManagerProps> = ({ mo
         <div className="flex items-center gap-2">
           <FileCheck2 className="w-4 h-4 text-brand-blue shrink-0" />
           <h5 className="text-xs font-mono font-bold uppercase tracking-wider text-ink m-0">
-            Research Approval Reference (Mandatory Before Approval or Publication)
+            Research Approval (Confirmation Required Before Approval or Publication)
           </h5>
         </div>
         <span className="text-[10px] font-mono text-slate-600">
@@ -749,33 +786,33 @@ export const DcmEvidenceCmsManager: React.FC<DcmEvidenceCmsManagerProps> = ({ mo
       </div>
 
       <p className="text-[11px] text-slate-700 leading-relaxed m-0">
-        Enter the documented Research sign-off reference (e.g. memo or ticket ID). Recording an approver name is an administrative log attached to your authenticated administrator account and does <strong>not</strong> constitute independent verification that approval occurred.
+        Approval reference and approver name are optional internal administrative fields. Confirming below attaches your authenticated administrator account and timestamp to this record.
       </p>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <div>
           <label className="block text-[11px] font-mono font-bold uppercase text-slate-700 mb-1">
-            Research Approval Reference *
+            Research Approval Reference <span className="text-slate-500">(Optional)</span>
           </label>
           <input
             type="text"
             disabled={isReadOnly}
             value={approvalRef}
             onChange={(e) => setApprovalRef(e.target.value)}
-            placeholder="e.g. AEO-RES-2026-11-19-EV01"
+            placeholder="Optional — e.g. AEO-RES-2026-11-19-EV01"
             className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg bg-white disabled:bg-slate-100"
           />
         </div>
         <div>
           <label className="block text-[11px] font-mono font-bold uppercase text-slate-700 mb-1">
-            Recorded Research Approver Name *
+            Recorded Research Approver Name <span className="text-slate-500">(Optional)</span>
           </label>
           <input
             type="text"
             disabled={isReadOnly}
             value={approverName}
             onChange={(e) => setApproverName(e.target.value)}
-            placeholder="e.g. Research Lead (recorded name)"
+            placeholder="Optional — e.g. Research Lead"
             className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg bg-white disabled:bg-slate-100"
           />
         </div>
@@ -790,7 +827,7 @@ export const DcmEvidenceCmsManager: React.FC<DcmEvidenceCmsManagerProps> = ({ mo
           className="mt-0.5"
         />
         <span>
-          I confirm this record contains only Research-approved public facts with a valid approval reference and no confidential contacts, internal notes, or unverified leads.
+          I confirm this record contains only Research-approved public facts and no confidential contacts, internal notes, or unverified leads.
         </span>
       </label>
     </div>
@@ -1656,16 +1693,15 @@ export const DcmEvidenceCmsManager: React.FC<DcmEvidenceCmsManagerProps> = ({ mo
                             <span>{hasPrivateNote ? 'Confidential Notes (Saved)' : 'Confidential Notes'}</span>
                           </button>
 
-                          {!isPub && (
-                            <button
-                              type="button"
-                              onClick={() => handleDeleteEvidenceAction(ev)}
-                              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-red-100 text-xs font-semibold text-red-700 cursor-pointer ml-auto"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                              <span>Delete</span>
-                            </button>
-                          )}
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteEvidenceAction(ev)}
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-red-100 text-xs font-semibold text-red-700 cursor-pointer ml-auto"
+                            title={isPub ? 'Delete published evidence record (in case of error)' : 'Delete evidence draft'}
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            <span>Delete</span>
+                          </button>
                         </div>
                       </div>
                     );
@@ -2346,15 +2382,15 @@ export const DcmEvidenceCmsManager: React.FC<DcmEvidenceCmsManagerProps> = ({ mo
                               <Lock className="w-3 h-3" />
                               <span>Private Notes</span>
                             </button>
-                            {!isPub && (
-                              <button
-                                type="button"
-                                onClick={() => handleDeleteIncidentAction(inc)}
-                                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-red-50 border border-red-200 text-red-700 text-xs font-semibold cursor-pointer"
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
-                            )}
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteIncidentAction(inc)}
+                              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-red-50 hover:bg-red-100 border border-red-200 text-red-700 text-xs font-semibold cursor-pointer"
+                              title={isPub ? 'Delete published incident record (in case of error)' : 'Delete incident draft'}
+                              aria-label={`Delete incident ${inc.id}`}
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
                           </div>
                         </div>
 
@@ -2412,7 +2448,7 @@ export const DcmEvidenceCmsManager: React.FC<DcmEvidenceCmsManagerProps> = ({ mo
                                         >
                                           {devPub ? 'View' : 'Edit'}
                                         </button>
-                                        {devPub ? (
+                                        {devPub && (
                                           <button
                                             type="button"
                                             onClick={() => handleIssueDevCorrection(dev)}
@@ -2420,16 +2456,16 @@ export const DcmEvidenceCmsManager: React.FC<DcmEvidenceCmsManagerProps> = ({ mo
                                           >
                                             Correction
                                           </button>
-                                        ) : (
-                                          <button
-                                            type="button"
-                                            onClick={() => handleDeleteDevelopmentAction(dev)}
-                                            className="p-1.5 rounded bg-red-50 border border-red-200 text-red-700 cursor-pointer"
-                                            aria-label="Delete development"
-                                          >
-                                            <Trash2 className="w-3 h-3" />
-                                          </button>
                                         )}
+                                        <button
+                                          type="button"
+                                          onClick={() => handleDeleteDevelopmentAction(dev)}
+                                          className="p-1.5 rounded bg-red-50 hover:bg-red-100 border border-red-200 text-red-700 cursor-pointer"
+                                          title={devPub ? 'Delete published development (in case of error)' : 'Delete development'}
+                                          aria-label="Delete development"
+                                        >
+                                          <Trash2 className="w-3 h-3" />
+                                        </button>
                                       </div>
                                     </div>
                                   );
@@ -2446,6 +2482,93 @@ export const DcmEvidenceCmsManager: React.FC<DcmEvidenceCmsManagerProps> = ({ mo
             </div>
           )}
         </>
+      )}
+
+      {/* IN-APP DELETE CONFIRMATION MODAL */}
+      {deleteConfirmTarget && (
+        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white border border-slate-200 rounded-2xl max-w-md w-full shadow-2xl overflow-hidden">
+            <div className="p-5 border-b border-slate-200 bg-red-50/70 flex items-start justify-between gap-3">
+              <div className="flex items-start gap-3">
+                <div className="w-9 h-9 rounded-xl bg-red-100 text-red-700 flex items-center justify-center shrink-0">
+                  <Trash2 className="w-4 h-4" />
+                </div>
+                <div>
+                  <h4 className="font-bold text-base text-slate-900">
+                    Delete {deleteConfirmTarget.isPublished ? 'Published ' : ''}
+                    {deleteConfirmTarget.kind === 'evidence'
+                      ? 'Evidence Record'
+                      : deleteConfirmTarget.kind === 'incident'
+                      ? 'Incident Record'
+                      : 'Incident Development'}?
+                  </h4>
+                  <p className="text-xs font-mono text-slate-500 mt-0.5 break-all">{deleteConfirmTarget.id}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={isDeletingRecord}
+                onClick={() => {
+                  setDeleteConfirmTarget(null);
+                  setConfirmPublishedDelete(false);
+                }}
+                className="p-1 rounded-lg hover:bg-white text-slate-500 hover:text-slate-900 cursor-pointer"
+                aria-label="Close delete dialog"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4 text-sm text-slate-700">
+              <p>
+                You are about to permanently delete <span className="font-semibold text-slate-900">&ldquo;{deleteConfirmTarget.title}&rdquo;</span>. This action cannot be undone.
+              </p>
+
+              {deleteConfirmTarget.isPublished && (
+                <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 space-y-2.5">
+                  <div className="flex items-start gap-2 text-xs text-red-900">
+                    <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                    <span>
+                      <strong>Published Record:</strong> Deleting this record permanently removes it from Firestore and any public state view referencing it.
+                    </span>
+                  </div>
+                  <label className="flex items-start gap-2 text-xs text-red-950 font-medium cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={confirmPublishedDelete}
+                      onChange={(e) => setConfirmPublishedDelete(e.target.checked)}
+                      className="mt-0.5 rounded border-red-300 text-red-600 focus:ring-red-500"
+                    />
+                    <span>I confirm this published record contains an error and should be permanently deleted.</span>
+                  </label>
+                </div>
+              )}
+            </div>
+
+            <div className="p-4 border-t border-slate-200 bg-slate-50 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                disabled={isDeletingRecord}
+                onClick={() => {
+                  setDeleteConfirmTarget(null);
+                  setConfirmPublishedDelete(false);
+                }}
+                className="px-4 py-2 rounded-xl text-xs font-semibold bg-white hover:bg-slate-100 text-slate-600 border border-slate-300 cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isDeletingRecord || (deleteConfirmTarget.isPublished && !confirmPublishedDelete)}
+                onClick={handleConfirmDeleteRecord}
+                className="px-4 py-2 rounded-xl text-xs font-bold uppercase tracking-wider bg-red-600 hover:bg-red-700 disabled:opacity-40 text-white shadow-sm flex items-center gap-1.5 cursor-pointer transition-colors"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>{isDeletingRecord ? 'Deleting...' : deleteConfirmTarget.isPublished ? 'Delete Permanently' : 'Delete Record'}</span>
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

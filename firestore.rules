@@ -41,16 +41,13 @@ service cloud.firestore {
           && data.subscribedAt is string;
     }
 
-    // Blueprint validator for /dcm_daily_publications/{publicationId}
-    // Stage 2 safeguard: requires a documented Research approval reference AND binds the
-    // recording administrator's authenticated UID + timestamp so a manually typed approver
-    // name alone is never accepted as verification.
+    // Blueprint validator for /dcm_daily_publications/{publicationId} and Stage 3 records.
+    // Binds the recording administrator's authenticated UID + timestamp on approval/publication,
+    // while allowing approvalReference and approvedByName to be optional administrative metadata.
     function isValidDcmDailyApproval(approval) {
       return approval is map
           && approval.keys().hasAll([
             'approved',
-            'approvalReference',
-            'approvedByName',
             'approvedAt',
             'recordedByUid',
             'recordedAt'
@@ -69,12 +66,8 @@ service cloud.firestore {
             'notes'
           ])
           && approval.approved == true
-          && approval.approvalReference is string
-          && approval.approvalReference.size() >= 3
-          && approval.approvalReference.size() <= 128
-          && approval.approvedByName is string
-          && approval.approvedByName.size() >= 2
-          && approval.approvedByName.size() <= 128
+          && (!('approvalReference' in approval) || (approval.approvalReference is string && approval.approvalReference.size() <= 128))
+          && (!('approvedByName' in approval) || (approval.approvedByName is string && approval.approvedByName.size() <= 128))
           && approval.approvedAt is string
           && approval.approvedAt.size() >= 10
           && approval.approvedAt.size() <= 64
@@ -548,10 +541,9 @@ service cloud.firestore {
                     && incoming().createdByUid == existing().createdByUid
                     && incoming().updatedByUid == request.auth.uid;
 
-      // Only authorised admins may delete non-published drafts/approved records; published editions cannot be deleted
+      // Only authorised admins may delete daily DCM records (including erroneous published editions)
       allow delete: if isAuthorizedAdmin()
-                    && isValidId(publicationId)
-                    && existing().status != 'published';
+                    && isValidId(publicationId);
     }
 
     // Stage 3: Public Evidence Records (strictly published + visibility == 'public' readable by visitors; immutable once published)
@@ -584,8 +576,7 @@ service cloud.firestore {
                     && incoming().updatedByUid == request.auth.uid;
 
       allow delete: if isAuthorizedAdmin()
-                    && isValidId(evidenceId)
-                    && existing().status != 'published';
+                    && isValidId(evidenceId);
     }
 
     // Stage 3: Incident Records (parent records grouping multiple chronological developments; immutable once published)
@@ -616,8 +607,7 @@ service cloud.firestore {
                     && incoming().updatedByUid == request.auth.uid;
 
       allow delete: if isAuthorizedAdmin()
-                    && isValidId(incidentId)
-                    && existing().status != 'published';
+                    && isValidId(incidentId);
     }
 
     // Stage 3: Incident Developments (dated developments associated with a parent incidentId; immutable once published)
@@ -648,8 +638,7 @@ service cloud.firestore {
                     && incoming().updatedByUid == request.auth.uid;
 
       allow delete: if isAuthorizedAdmin()
-                    && isValidId(developmentId)
-                    && existing().status != 'published';
+                    && isValidId(developmentId);
     }
 
     // Stage 3: Confidential / Private Notes (strictly admin-only isolation for internal notes, contacts & unverified leads)

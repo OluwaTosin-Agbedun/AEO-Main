@@ -129,7 +129,6 @@ runTest('Mobile-first page hierarchy order and preserved explanatory sections', 
   const purposeIdx = dcmPreviewSource.indexOf(
     'Evidence-based classifications of the practical conditions for political competition across Nigeria'
   );
-  const watCutoffIdx = dcmPreviewSource.indexOf('Evidence cut-off:');
   const mapCardIdx = dcmPreviewSource.indexOf('id="dcm-map-section"');
   const mapInstructionIdx = dcmPreviewSource.indexOf('{MAP_SELECTION_INSTRUCTION}');
   const dailyUpdateIdx = dcmPreviewSource.indexOf('id="dcm-daily-update"');
@@ -140,8 +139,15 @@ runTest('Mobile-first page hierarchy order and preserved explanatory sections', 
 
   assert.ok(titleIdx > 0, 'Title must exist');
   assert.ok(purposeIdx > titleIdx, 'Short purpose statement must follow title');
-  assert.ok(watCutoffIdx > purposeIdx, 'WAT cut-off metadata must follow purpose statement');
-  assert.ok(mapCardIdx > watCutoffIdx, 'Interactive Nigeria map must follow WAT cut-off');
+  assert.ok(
+    !dcmPreviewSource.includes('Latest published review:'),
+    'Latest published review header line must be removed'
+  );
+  assert.ok(
+    dcmPreviewSource.includes('Democratic Competitiveness Map as of '),
+    'Map card heading must use Democratic Competitiveness Map as of <date>'
+  );
+  assert.ok(mapCardIdx > purposeIdx, 'Interactive Nigeria map must follow purpose statement');
   assert.ok(mapInstructionIdx > mapCardIdx, 'Map selection instruction must follow map');
   assert.ok(dailyUpdateIdx > mapInstructionIdx, '"What changed today?" section must sit immediately below map');
   assert.ok(quickNavIdx > dailyUpdateIdx, 'Mobile quick-jump links must follow update section');

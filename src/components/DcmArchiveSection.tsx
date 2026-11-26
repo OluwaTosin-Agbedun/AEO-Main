@@ -186,7 +186,7 @@ export const DcmArchiveSection: React.FC<DcmArchiveSectionProps> = ({
           Daily &amp; Historical DCM Archive
         </h2>
         <p className="m-0 text-sm text-[#3d4752] leading-relaxed">
-          Browse approved daily DCM publications and earlier twice-monthly reporting periods. Every published edition has a permanent link that preserves its original snapshot and WAT evidence cut-off.
+          Browse approved daily DCM publications and earlier twice-monthly reporting periods. Every published edition has a permanent link that preserves its original snapshot.
         </p>
       </div>
 
@@ -477,10 +477,6 @@ export const DcmArchiveSection: React.FC<DcmArchiveSectionProps> = ({
                       <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-[#3d4752] tabular-nums">
                         <span>
                           <strong>Published:</strong> {entry.publicationDateLabel}
-                        </span>
-                        <span aria-hidden="true" className="text-slate-400">·</span>
-                        <span>
-                          <strong>Evidence cut-off:</strong> {entry.evidenceCutoffLabel}
                         </span>
                         <span aria-hidden="true" className="text-slate-400">·</span>
                         <span className="font-mono text-[11px] text-slate-500 break-all">

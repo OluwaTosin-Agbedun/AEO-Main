@@ -1497,13 +1497,6 @@ export function CMSProvider({ children }: { children: ReactNode }) {
         const sfDoc = await transaction.get(docRef);
         const current: DcmPublication[] = sfDoc.exists() && Array.isArray(sfDoc.data()?.items) ? sfDoc.data()!.items : [];
 
-        const target = current.find(p => p.id === id);
-        if (target && target.status === 'published') {
-          throw new Error(
-            `Historical protection: Published DCM edition "${id}" cannot be deleted.`
-          );
-        }
-
         nextDcm = current.filter(p => p.id !== id);
         const tsNow = Date.now();
         transaction.set(docRef, removeUndefined({ items: nextDcm, updatedAt: tsNow }));
@@ -1636,16 +1629,6 @@ export function CMSProvider({ children }: { children: ReactNode }) {
     const docRef = doc(db, 'dcm_daily_publications', id);
 
     try {
-      const existingSnap = await getDoc(docRef);
-      if (existingSnap.exists()) {
-        const existingDoc = existingSnap.data() as DcmPublication;
-        if (existingDoc.status === 'published') {
-          throw new Error(
-            `Historical protection: Published daily edition "${id}" cannot be deleted.`
-          );
-        }
-      }
-
       await deleteDoc(docRef);
       setDcmDailyPublications((prev) => prev.filter((item) => item.id !== id));
     } catch (err) {
@@ -1746,14 +1729,10 @@ export function CMSProvider({ children }: { children: ReactNode }) {
   };
 
   const deleteDcmEvidence = async (id: string): Promise<void> => {
-    await requireAuthorizedAdmin('delete evidence drafts');
+    await requireAuthorizedAdmin('delete evidence records');
     const docPath = `dcm_evidence/${id}`;
     const docRef = doc(db, 'dcm_evidence', id);
     try {
-      const existingSnap = await getDoc(docRef);
-      if (existingSnap.exists() && (existingSnap.data() as DcmEvidenceRecord).status === 'published') {
-        throw new Error(`Historical protection: Published evidence record "${id}" cannot be deleted.`);
-      }
       await deleteDoc(docRef);
       setDcmEvidence((prev) => prev.filter((item) => item.id !== id));
     } catch (err) {
@@ -1811,14 +1790,10 @@ export function CMSProvider({ children }: { children: ReactNode }) {
   };
 
   const deleteDcmIncident = async (id: string): Promise<void> => {
-    await requireAuthorizedAdmin('delete incident drafts');
+    await requireAuthorizedAdmin('delete incident records');
     const docPath = `dcm_incidents/${id}`;
     const docRef = doc(db, 'dcm_incidents', id);
     try {
-      const existingSnap = await getDoc(docRef);
-      if (existingSnap.exists() && (existingSnap.data() as DcmIncidentRecord).status === 'published') {
-        throw new Error(`Historical protection: Published incident record "${id}" cannot be deleted.`);
-      }
       await deleteDoc(docRef);
       setDcmIncidents((prev) => prev.filter((item) => item.id !== id));
     } catch (err) {
@@ -1891,14 +1866,10 @@ export function CMSProvider({ children }: { children: ReactNode }) {
   };
 
   const deleteDcmIncidentDevelopment = async (id: string): Promise<void> => {
-    await requireAuthorizedAdmin('delete incident development drafts');
+    await requireAuthorizedAdmin('delete incident developments');
     const docPath = `dcm_incident_developments/${id}`;
     const docRef = doc(db, 'dcm_incident_developments', id);
     try {
-      const existingSnap = await getDoc(docRef);
-      if (existingSnap.exists() && (existingSnap.data() as DcmIncidentDevelopment).status === 'published') {
-        throw new Error(`Historical protection: Published incident development "${id}" cannot be deleted.`);
-      }
       await deleteDoc(docRef);
       setDcmIncidentDevelopments((prev) => prev.filter((item) => item.id !== id));
     } catch (err) {

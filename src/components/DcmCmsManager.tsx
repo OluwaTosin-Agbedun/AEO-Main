@@ -25,7 +25,6 @@ import { DcmMap } from './DcmMap';
 import { INITIAL_DCM_PUBLICATIONS } from '../data/dcmInitialData';
 import { getLatestDcmPublication, getPublishedDcmSorted } from '../utils/dcmComparison';
 import {
-  WAT_LABEL,
   buildDailyPublicationId,
   carryForwardClassifications,
   createBlank37Classifications,
@@ -89,6 +88,9 @@ export const DcmCmsManager: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mainListFileInputRef = useRef<HTMLInputElement>(null);
   const [showCsvGuide, setShowCsvGuide] = useState<boolean>(false);
+  const [deleteTarget, setDeleteTarget] = useState<DcmPublication | null>(null);
+  const [confirmPublishedDelete, setConfirmPublishedDelete] = useState<boolean>(false);
+  const [isDeleting, setIsDeleting] = useState<boolean>(false);
 
   const isEditingDaily = isDailyPublication(editingPub);
   const existingRecord = useMemo(() => {
@@ -141,14 +143,6 @@ export const DcmCmsManager: React.FC = () => {
     return auditPublicationConsistency(candidate, carryForwardSourcePub);
   }, [editingPub, isEditingDaily, classifications, carryForwardSourcePub]);
 
-  const dailyWatPreview = useMemo(() => {
-    if (!isEditingDaily) return null;
-    return formatWatCutoff(
-      editingPub?.assessmentDate || '',
-      editingPub?.evidenceCutoffTimeWat || ''
-    );
-  }, [isEditingDaily, editingPub?.assessmentDate, editingPub?.evidenceCutoffTimeWat]);
-
   const filteredPublicationsList = useMemo(() => {
     return publications.filter((pub) => {
       const daily = isDailyPublication(pub);
@@ -198,7 +192,7 @@ export const DcmCmsManager: React.FC = () => {
     if (sourcePub) {
       showStatus(
         opts?.isQuietDay
-          ? `Quiet-day daily draft initialized from "${sourcePub.reportingPeriodLabel}". All 37 approved classifications are retained without change. Enter the Research-approved quiet-day statement and WAT cut-off time.`
+          ? `Quiet-day daily draft initialized from "${sourcePub.reportingPeriodLabel}". All 37 approved classifications are retained without change. Enter the Research-approved quiet-day statement below.`
           : `Daily draft initialized from "${sourcePub.reportingPeriodLabel}". All 37 approved classifications have been carried forward unchanged.`
       );
     }
@@ -323,21 +317,6 @@ export const DcmCmsManager: React.FC = () => {
         reportingPeriodLabel: label,
         publicationDate: label,
         title: parsed ? `Democratic Competitiveness Map — Daily Update: ${label}` : prev.title,
-        evidenceCutoffDate: wat.valid ? wat.displayLabel : prev.evidenceCutoffDate,
-        evidenceCutoffDateTimeWat: wat.valid ? wat.isoWat : ''
-      };
-    });
-  };
-
-  // Daily WAT cut-off time change
-  const handleDailyCutoffTimeChange = (nextTime: string) => {
-    if (isReadOnlyPublishedDaily) return;
-    setEditingPub((prev) => {
-      if (!prev) return prev;
-      const wat = formatWatCutoff(prev.assessmentDate || '', nextTime);
-      return {
-        ...prev,
-        evidenceCutoffTimeWat: nextTime,
         evidenceCutoffDate: wat.valid ? wat.displayLabel : prev.evidenceCutoffDate,
         evidenceCutoffDateTimeWat: wat.valid ? wat.isoWat : ''
       };
@@ -864,9 +843,10 @@ export const DcmCmsManager: React.FC = () => {
   const handleSaveDaily = async (targetStatus: 'draft' | 'approved' | 'published') => {
     if (!editingPub || isSaving || isReadOnlyPublishedDaily) return;
 
+    const cutoffTimeFallback = editingPub.evidenceCutoffTimeWat || '17:00';
     const wat = formatWatCutoff(
       editingPub.assessmentDate || '',
-      editingPub.evidenceCutoffTimeWat || ''
+      cutoffTimeFallback
     );
     const parsedDate = parseIsoDate(editingPub.assessmentDate || '');
     const nowIso = new Date().toISOString();
@@ -875,21 +855,20 @@ export const DcmCmsManager: React.FC = () => {
     const currentUid = auth.currentUser?.uid || '';
     const currentEmail = auth.currentUser?.email || undefined;
 
-    const approvalRecord =
-      approvalConfirmed && approverName.trim().length >= 2 && approvalReference.trim().length >= 3
-        ? {
-            approved: true,
-            approvalReference: approvalReference.trim(),
-            approvedByName: approverName.trim(),
-            approvedAt: editingPub.approvalRecord?.approvedAt || nowIso,
-            recordedByUid: currentUid,
-            recordedByEmail: currentEmail,
-            recordedAt: nowIso,
-            approvedByUid: currentUid,
-            approvedByEmail: currentEmail,
-            verificationMode: 'admin-recorded-reference' as const
-          }
-        : undefined;
+    const approvalRecord = approvalConfirmed
+      ? {
+          approved: true,
+          approvalReference: approvalReference.trim(),
+          approvedByName: approverName.trim(),
+          approvedAt: editingPub.approvalRecord?.approvedAt || nowIso,
+          recordedByUid: currentUid,
+          recordedByEmail: currentEmail,
+          recordedAt: nowIso,
+          approvedByUid: currentUid,
+          approvedByEmail: currentEmail,
+          verificationMode: 'admin-recorded-reference' as const
+        }
+      : undefined;
 
     const candidate: DcmPublication = {
       id: editingPub.id || buildDailyPublicationId(editingPub.assessmentDate || '', publications.map((p) => p.id)),
@@ -904,7 +883,7 @@ export const DcmCmsManager: React.FC = () => {
       publicationDate: editingPub.publicationDate?.trim() || dateLabel,
       evidenceCutoffDate: wat.valid ? wat.displayLabel : '',
       assessmentDate: editingPub.assessmentDate || '',
-      evidenceCutoffTimeWat: editingPub.evidenceCutoffTimeWat || '',
+      evidenceCutoffTimeWat: cutoffTimeFallback,
       evidenceCutoffDateTimeWat: wat.valid ? wat.isoWat : '',
       publishedAt: targetStatus === 'published' ? nowIso : undefined,
       isQuietDay: Boolean(editingPub.isQuietDay),
@@ -980,21 +959,20 @@ export const DcmCmsManager: React.FC = () => {
     const currentEmail = auth.currentUser?.email || undefined;
     const targetStatus = (editingPub.status as any) || 'draft';
 
-    const approvalRecord =
-      approvalConfirmed && approverName.trim().length >= 2 && approvalReference.trim().length >= 3
-        ? {
-            approved: true,
-            approvalReference: approvalReference.trim(),
-            approvedByName: approverName.trim(),
-            approvedAt: editingPub.approvalRecord?.approvedAt || nowIso,
-            recordedByUid: currentUid,
-            recordedByEmail: currentEmail,
-            recordedAt: nowIso,
-            approvedByUid: currentUid,
-            approvedByEmail: currentEmail,
-            verificationMode: 'admin-recorded-reference' as const
-          }
-        : undefined;
+    const approvalRecord = approvalConfirmed
+      ? {
+          approved: true,
+          approvalReference: approvalReference.trim(),
+          approvedByName: approverName.trim(),
+          approvedAt: editingPub.approvalRecord?.approvedAt || nowIso,
+          recordedByUid: currentUid,
+          recordedByEmail: currentEmail,
+          recordedAt: nowIso,
+          approvedByUid: currentUid,
+          approvedByEmail: currentEmail,
+          verificationMode: 'admin-recorded-reference' as const
+        }
+      : undefined;
 
     const finalPub: DcmPublication = {
       id: editingPub.id || `dcm-${Date.now()}`,
@@ -1058,24 +1036,34 @@ export const DcmCmsManager: React.FC = () => {
     }
   };
 
-  // Delete publication handler (protects ALL published editions—daily and legacy—from deletion)
-  const handleDelete = async (pub: DcmPublication) => {
-    if (pub.status === 'published') {
-      showStatus('Published DCM editions are immutable historical records and cannot be deleted. Issue a corrected revision instead.', 'error');
-      return;
-    }
+  // Open in-app delete confirmation modal (supports deleting drafts, approved, and erroneous published editions)
+  const handleDelete = (pub: DcmPublication) => {
+    setDeleteTarget(pub);
+    setConfirmPublishedDelete(false);
+  };
 
-    if (window.confirm(`Are you sure you want to delete "${pub.title}"? This action cannot be undone.`)) {
-      try {
-        if (isDailyPublication(pub)) {
-          await deleteDailyDcmPublication(pub.id);
-        } else {
-          await deleteDcmPublication(pub.id);
-        }
-        showStatus(`Deleted "${pub.title}".`);
-      } catch (err: any) {
-        showStatus(`Failed to delete: ${err.message}`, 'error');
+  const handleConfirmDelete = async () => {
+    if (!deleteTarget || isDeleting) return;
+    if (deleteTarget.status === 'published' && !confirmPublishedDelete) return;
+
+    const target = deleteTarget;
+    setIsDeleting(true);
+    try {
+      if (isDailyPublication(target)) {
+        await deleteDailyDcmPublication(target.id);
+      } else {
+        await deleteDcmPublication(target.id);
       }
+      if (editingExistingId === target.id || editingPub?.id === target.id) {
+        handleCancel();
+      }
+      setDeleteTarget(null);
+      setConfirmPublishedDelete(false);
+      showStatus(`Deleted "${target.title}".`);
+    } catch (err: any) {
+      showStatus(`Failed to delete: ${err.message}`, 'error');
+    } finally {
+      setIsDeleting(false);
     }
   };
 
@@ -1407,12 +1395,6 @@ export const DcmCmsManager: React.FC = () => {
                           <span>{pub.reportingPeriodLabel}</span>
                           <span className="text-[10px] text-slate-400">· {pub.methodologyVersion || 'v1.1'}</span>
                         </div>
-                        {daily && pub.evidenceCutoffDate && (
-                          <div className="flex items-center gap-2 text-indigo-700">
-                            <Clock className="w-3.5 h-3.5 shrink-0" />
-                            <span>Cut-off: {pub.evidenceCutoffDate}</span>
-                          </div>
-                        )}
                         {daily && carriedCount > 0 && (
                           <div className="text-[11px] text-slate-600">
                             {carriedCount === 37
@@ -1476,16 +1458,15 @@ export const DcmCmsManager: React.FC = () => {
                           )}
                         </button>
 
-                        {!isImmutablePublished && (
-                          <button
-                            type="button"
-                            onClick={() => handleDelete(pub)}
-                            className="p-1.5 rounded-lg text-mut hover:text-red-600 hover:bg-red-50 transition-colors cursor-pointer"
-                            title="Delete publication"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
-                        )}
+                        <button
+                          type="button"
+                          onClick={() => handleDelete(pub)}
+                          className="p-1.5 rounded-lg text-mut hover:text-red-600 hover:bg-red-50 transition-colors cursor-pointer"
+                          title={isImmutablePublished ? 'Delete published edition (in case of error)' : 'Delete publication'}
+                          aria-label={`Delete ${pub.title}`}
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
                       </div>
                     </div>
                   </div>
@@ -1547,6 +1528,19 @@ export const DcmCmsManager: React.FC = () => {
               >
                 {isReadOnlyPublishedDaily ? 'Back to List' : 'Cancel'}
               </button>
+
+              {existingRecord && (
+                <button
+                  type="button"
+                  disabled={isDeleting || isSaving}
+                  onClick={() => handleDelete(existingRecord)}
+                  className="px-3.5 py-2 rounded-xl text-xs font-mono font-semibold bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 disabled:opacity-50 flex items-center gap-1.5 transition-all cursor-pointer"
+                  title="Delete this publication record"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Delete</span>
+                </button>
+              )}
 
               {!isReadOnlyPublishedDaily ? (
                 !isEditingDaily ? (
@@ -1635,7 +1629,7 @@ export const DcmCmsManager: React.FC = () => {
               <div className="flex items-center justify-between flex-wrap gap-2 border-b border-line pb-2">
                 <h4 className="font-display font-bold text-sm text-ink uppercase tracking-wider flex items-center gap-2">
                   <Clock className="w-4 h-4 text-indigo-700" />
-                  <span>Daily Publication Metadata, WAT Cut-Off & Carry-Forward</span>
+                  <span>Daily Publication Metadata & Carry-Forward</span>
                 </h4>
                 <span className="text-[11px] font-mono text-mut">
                   Current Status: <strong className="uppercase text-ink">{editingPub.status || 'draft'}</strong>
@@ -1665,26 +1659,13 @@ export const DcmCmsManager: React.FC = () => {
                   />
                 </div>
 
-                <div className="space-y-1">
+                <div className="space-y-1 md:col-span-2">
                   <label className="block text-[10px] font-mono font-bold uppercase text-mut">Assessment Date (YYYY-MM-DD)</label>
                   <input
                     type="date"
                     disabled={isReadOnlyPublishedDaily}
                     value={editingPub.assessmentDate || ''}
                     onChange={e => handleDailyAssessmentDateChange(e.target.value)}
-                    className="w-full text-xs p-2.5 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue disabled:bg-slate-50"
-                  />
-                </div>
-
-                <div className="space-y-1">
-                  <label className="block text-[10px] font-mono font-bold uppercase text-mut">
-                    Evidence Cut-Off Time ({WAT_LABEL})
-                  </label>
-                  <input
-                    type="time"
-                    disabled={isReadOnlyPublishedDaily}
-                    value={editingPub.evidenceCutoffTimeWat || '17:00'}
-                    onChange={e => handleDailyCutoffTimeChange(e.target.value)}
                     className="w-full text-xs p-2.5 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue disabled:bg-slate-50"
                   />
                 </div>
@@ -1698,22 +1679,6 @@ export const DcmCmsManager: React.FC = () => {
                     onChange={e => setEditingPub(p => ({ ...p, methodologyVersion: e.target.value }))}
                     className="w-full text-xs p-2.5 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue disabled:bg-slate-50"
                   />
-                </div>
-
-                {/* Live WAT Cut-off Preview Bar */}
-                <div className="md:col-span-3 p-3 rounded-xl bg-indigo-50/70 border border-indigo-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
-                  <div className="flex items-center gap-2 text-indigo-950">
-                    <Clock className="w-4 h-4 text-indigo-700 shrink-0" />
-                    <span>
-                      <strong>Formatted WAT Cut-Off:</strong>{' '}
-                      {dailyWatPreview?.valid ? dailyWatPreview.displayLabel : 'Enter a valid assessment date and 24-hour WAT time.'}
-                    </span>
-                  </div>
-                  {dailyWatPreview?.valid && (
-                    <code className="text-[11px] font-mono bg-white px-2 py-0.5 rounded border border-indigo-200 text-indigo-800">
-                      {dailyWatPreview.isoWat}
-                    </code>
-                  )}
                 </div>
 
                 {/* Carry-Forward Source Control */}
@@ -1771,7 +1736,7 @@ export const DcmCmsManager: React.FC = () => {
                     <label htmlFor="dcm-quiet-day-toggle" className="text-xs text-ink cursor-pointer">
                       <span className="font-bold">Quiet-Day Update (No classification changes)</span>
                       <span className="block text-[11px] text-mut mt-0.5">
-                        Locks all 37 state classifications to the carried-forward approved snapshot. Enter the Research-approved quiet-day statement below, including the actual evidence cut-off time (WAT). The CMS never auto-asserts that no incidents occurred.
+                        Locks all 37 state classifications to the carried-forward approved snapshot. Enter the Research-approved quiet-day statement below. The CMS never auto-asserts that no incidents occurred.
                       </span>
                     </label>
                   </div>
@@ -1781,7 +1746,7 @@ export const DcmCmsManager: React.FC = () => {
                 <div className="md:col-span-3 space-y-1">
                   <label className="block text-[10px] font-mono font-bold uppercase text-mut">
                     {editingPub.isQuietDay
-                      ? 'Research-Approved Quiet-Day Statement (Include Actual WAT Cut-Off Time)'
+                      ? 'Research-Approved Quiet-Day Statement'
                       : 'Research-Approved Daily Summary'}
                   </label>
                   <textarea
@@ -1791,7 +1756,7 @@ export const DcmCmsManager: React.FC = () => {
                     onChange={e => setEditingPub(p => ({ ...p, summary: e.target.value }))}
                     placeholder={
                       editingPub.isQuietDay
-                        ? `Enter the Research-approved statement verbatim, including the actual cut-off time (e.g. "${dailyWatPreview?.displayLabel || '19 November 2026, 17:00 WAT (UTC+01:00)'}"). Do not rely on automated text.`
+                        ? 'Enter the Research-approved quiet-day statement verbatim. Do not rely on automated text.'
                         : 'Enter the Research-approved daily summary verbatim...'
                     }
                     className="w-full text-xs p-2.5 border border-line rounded-lg focus:outline-none focus:border-brand-blue disabled:bg-slate-50"
@@ -1932,7 +1897,7 @@ export const DcmCmsManager: React.FC = () => {
                   />
                 </div>
 
-                <div className="space-y-1">
+                <div className="space-y-1 md:col-span-2">
                   <label className="block text-[10px] font-mono font-bold uppercase text-mut">Publication Date</label>
                   <input 
                     type="text"
@@ -1940,18 +1905,6 @@ export const DcmCmsManager: React.FC = () => {
                     value={editingPub.publicationDate || ''}
                     onChange={e => setEditingPub(p => ({ ...p, publicationDate: e.target.value }))}
                     placeholder="e.g. 16 October 2026"
-                    className="w-full text-xs p-2.5 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue disabled:bg-slate-50"
-                  />
-                </div>
-
-                <div className="space-y-1">
-                  <label className="block text-[10px] font-mono font-bold uppercase text-mut">Evidence Cut-off Date</label>
-                  <input 
-                    type="text"
-                    disabled={isReadOnlyPublishedDaily}
-                    value={editingPub.evidenceCutoffDate || ''}
-                    onChange={e => setEditingPub(p => ({ ...p, evidenceCutoffDate: e.target.value }))}
-                    placeholder="e.g. 15 October 2026"
                     className="w-full text-xs p-2.5 border border-line rounded-lg font-mono focus:outline-none focus:border-brand-blue disabled:bg-slate-50"
                   />
                 </div>
@@ -2417,7 +2370,7 @@ export const DcmCmsManager: React.FC = () => {
               </div>
 
               {/* Review Summary Grid */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
                 <div className="bg-white border border-line rounded-lg p-3 space-y-0.5">
                   <div className="text-[10px] font-mono uppercase text-mut">
                     {isEditingDaily ? 'Assessment Date' : 'Reporting Period'}
@@ -2426,16 +2379,6 @@ export const DcmCmsManager: React.FC = () => {
                     {isEditingDaily
                       ? (editingPub.assessmentDate ? formatDailyDateLabel(editingPub.assessmentDate) : 'Not set')
                       : (editingPub.reportingPeriodLabel || 'Not set')}
-                  </div>
-                </div>
-                <div className="bg-white border border-line rounded-lg p-3 space-y-0.5">
-                  <div className="text-[10px] font-mono uppercase text-mut">
-                    {isEditingDaily ? 'Evidence Cut-Off (WAT)' : 'Evidence Cut-Off'}
-                  </div>
-                  <div className="font-bold text-indigo-800">
-                    {isEditingDaily
-                      ? (dailyWatPreview?.valid ? dailyWatPreview.displayLabel : 'Invalid / Missing')
-                      : (editingPub.evidenceCutoffDate || 'Not set')}
                   </div>
                 </div>
                 <div className="bg-white border border-line rounded-lg p-3 space-y-0.5">
@@ -2471,7 +2414,7 @@ export const DcmCmsManager: React.FC = () => {
                 <Info className="w-4 h-4 text-indigo-700 shrink-0 mt-0.5" />
                 <div className="space-y-0.5 leading-relaxed">
                   <p>
-                    <strong>Administrative record notice:</strong> Entering a Research approver name is an administrative record only and is <strong>not</strong> independent verification that Research approval occurred. A documented Research approval reference (e.g. memo, email log, or sign-off ticket ID) is mandatory prior to publication.
+                    <strong>Administrative record notice:</strong> Research approval reference and approver name are optional internal administrative fields. Confirming Research approval below attaches your authenticated administrator account and timestamp to this record.
                   </p>
                   <p className="font-mono text-[10px] text-indigo-800">
                     Recording Administrator Identity:{' '}
@@ -2485,27 +2428,27 @@ export const DcmCmsManager: React.FC = () => {
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-1">
                 <div className="space-y-1">
                   <label className="block text-[10px] font-mono font-bold uppercase text-mut">
-                    Documented Research Approval Reference <span className="text-red-600">* (Required to Approve / Publish)</span>
+                    Documented Research Approval Reference <span className="text-slate-500">(Optional)</span>
                   </label>
                   <input
                     type="text"
                     disabled={isReadOnlyPublishedDaily}
                     value={approvalReference}
                     onChange={e => setApprovalReference(e.target.value)}
-                    placeholder="e.g. AEO-RES-2026-11-19 or Memo/Sign-Off ID"
+                    placeholder="Optional — e.g. AEO-RES-2026-11-19 or Memo ID"
                     className="w-full text-xs p-2.5 border border-line rounded-lg bg-white font-mono focus:outline-none focus:border-brand-blue disabled:bg-slate-100"
                   />
                 </div>
                 <div className="space-y-1">
                   <label className="block text-[10px] font-mono font-bold uppercase text-mut">
-                    Recorded Research Approver Name <span className="text-red-600">* (Administrative Record)</span>
+                    Recorded Research Approver Name <span className="text-slate-500">(Optional)</span>
                   </label>
                   <input
                     type="text"
                     disabled={isReadOnlyPublishedDaily}
                     value={approverName}
                     onChange={e => setApproverName(e.target.value)}
-                    placeholder="e.g. Dr. Amina Bello — Head of Research"
+                    placeholder="Optional — e.g. Dr. Amina Bello — Head of Research"
                     className="w-full text-xs p-2.5 border border-line rounded-lg bg-white focus:outline-none focus:border-brand-blue disabled:bg-slate-100"
                   />
                 </div>
@@ -2521,9 +2464,9 @@ export const DcmCmsManager: React.FC = () => {
                   className="rounded text-indigo-700 focus:ring-indigo-600 w-4 h-4 mt-0.5 cursor-pointer disabled:cursor-not-allowed"
                 />
                 <label htmlFor="dcm-research-approval-confirm" className="text-xs text-ink cursor-pointer">
-                  <span className="font-bold">Record Documented Research Approval</span>
+                  <span className="font-bold">Confirm Research Approval</span>
                   <span className="block text-[11px] text-mut mt-0.5">
-                    I confirm that this publication summary, evidence cut-off, and all 37 state classifications match the documented Research approval reference above. My administrator UID and timestamp will be stored with this record, and once published it will be locked against overwrite or deletion.
+                    I confirm that this publication summary and all 37 state classifications are Research-approved for publication. My administrator UID and timestamp will be stored with this record.
                   </span>
                 </label>
               </div>
@@ -2542,7 +2485,7 @@ export const DcmCmsManager: React.FC = () => {
 
                   <button
                     type="button"
-                    disabled={isSaving || !approvalConfirmed || approverName.trim().length < 2 || approvalReference.trim().length < 3}
+                    disabled={isSaving || !approvalConfirmed}
                     onClick={() => handleSaveDaily('approved')}
                     className="px-4 py-2 rounded-xl text-xs font-mono font-bold uppercase tracking-wider bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white flex items-center gap-1.5 cursor-pointer disabled:cursor-not-allowed"
                   >
@@ -2552,7 +2495,7 @@ export const DcmCmsManager: React.FC = () => {
 
                   <button
                     type="button"
-                    disabled={isSaving || !approvalConfirmed || approverName.trim().length < 2 || approvalReference.trim().length < 3}
+                    disabled={isSaving || !approvalConfirmed}
                     onClick={() => handleSaveDaily('published')}
                     className="px-5 py-2 rounded-xl text-xs font-mono font-bold uppercase tracking-wider bg-brand-green hover:bg-emerald-700 disabled:opacity-40 text-white shadow-sm flex items-center gap-1.5 cursor-pointer disabled:cursor-not-allowed"
                   >
@@ -2760,6 +2703,90 @@ export const DcmCmsManager: React.FC = () => {
                   <span>Download Acceptable CSV Format</span>
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* IN-APP DELETE CONFIRMATION MODAL */}
+      {deleteTarget && (
+        <div className="fixed inset-0 z-50 bg-ink/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white border border-line rounded-2xl max-w-md w-full shadow-2xl overflow-hidden">
+            <div className="p-5 border-b border-line bg-red-50/70 flex items-start justify-between gap-3">
+              <div className="flex items-start gap-3">
+                <div className="w-10 h-10 rounded-xl bg-red-100 text-red-700 flex items-center justify-center shrink-0">
+                  <Trash2 className="w-5 h-5" />
+                </div>
+                <div>
+                  <h4 className="font-display font-bold text-lg text-ink">
+                    {deleteTarget.status === 'published' ? 'Delete Published DCM Edition?' : 'Delete DCM Draft?'}
+                  </h4>
+                  <p className="text-xs font-mono text-mut mt-0.5 break-all">
+                    {deleteTarget.id}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={isDeleting}
+                onClick={() => {
+                  setDeleteTarget(null);
+                  setConfirmPublishedDelete(false);
+                }}
+                className="p-1 rounded-lg hover:bg-white text-mut hover:text-ink cursor-pointer"
+                aria-label="Close delete dialog"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4 text-sm text-ink">
+              <p className="text-slate-700">
+                You are about to permanently delete <span className="font-semibold text-ink">&ldquo;{deleteTarget.title}&rdquo;</span> ({deleteTarget.reportingPeriodLabel}). This action cannot be undone.
+              </p>
+
+              {deleteTarget.status === 'published' && (
+                <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 space-y-3">
+                  <div className="flex items-start gap-2 text-xs text-red-900">
+                    <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                    <span>
+                      <strong>Live Public Record:</strong> This edition is currently published on the public Democratic Competitiveness Map. Deleting it immediately removes it from Firestore and the public archive.
+                    </span>
+                  </div>
+                  <label className="flex items-start gap-2.5 text-xs text-red-950 font-medium cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={confirmPublishedDelete}
+                      onChange={(e) => setConfirmPublishedDelete(e.target.checked)}
+                      className="mt-0.5 rounded border-red-300 text-red-600 focus:ring-red-500"
+                    />
+                    <span>I confirm this published edition contains an error and should be permanently deleted.</span>
+                  </label>
+                </div>
+              )}
+            </div>
+
+            <div className="p-4 border-t border-line bg-paper flex items-center justify-end gap-2">
+              <button
+                type="button"
+                disabled={isDeleting}
+                onClick={() => {
+                  setDeleteTarget(null);
+                  setConfirmPublishedDelete(false);
+                }}
+                className="px-4 py-2 rounded-xl text-xs font-mono font-semibold bg-white hover:bg-line text-mut hover:text-ink border border-line cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isDeleting || (deleteTarget.status === 'published' && !confirmPublishedDelete)}
+                onClick={handleConfirmDelete}
+                className="px-4 py-2 rounded-xl text-xs font-mono font-bold uppercase tracking-wider bg-red-600 hover:bg-red-700 disabled:opacity-40 text-white shadow-sm flex items-center gap-1.5 cursor-pointer transition-colors"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>{isDeleting ? 'Deleting...' : deleteTarget.status === 'published' ? 'Delete Permanently' : 'Delete Draft'}</span>
+              </button>
             </div>
           </div>
         </div>

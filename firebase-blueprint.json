@@ -167,7 +167,7 @@
             "verificationMode": { "type": "string", "enum": ["admin-recorded-reference"] },
             "notes": { "type": "string", "maxLength": 500 }
           },
-          "required": ["approved", "approvalReference", "approvedByName", "approvedAt", "recordedByUid", "recordedAt"]
+          "required": ["approved", "approvedAt", "recordedByUid", "recordedAt"]
         },
         "methodologyVersion": { "type": "string", "maxLength": 64 },
         "revisionNote": { "type": "string", "maxLength": 500 },

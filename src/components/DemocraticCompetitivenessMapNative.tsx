@@ -717,7 +717,7 @@ export const DemocraticCompetitivenessMapNative: React.FC = () => {
             )}
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-xs font-mono">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs font-mono">
             <div className="p-3.5 bg-paper rounded-xl border border-line space-y-1">
               <span className="text-mut block">Reporting Period</span>
               <span className="font-bold text-ink text-sm font-sans block">{canonicalView.meta.periodLabel}</span>
@@ -726,11 +726,6 @@ export const DemocraticCompetitivenessMapNative: React.FC = () => {
             <div className="p-3.5 bg-paper rounded-xl border border-line space-y-1">
               <span className="text-mut block">Publication Date</span>
               <span className="font-bold text-ink text-sm font-sans block">{canonicalView.meta.publicationDateLabel}</span>
-            </div>
-
-            <div className="p-3.5 bg-paper rounded-xl border border-line space-y-1">
-              <span className="text-mut block">Evidence Cut-off</span>
-              <span className="font-bold text-ink text-sm font-sans block">{canonicalView.meta.evidenceCutoffLabel}</span>
             </div>
 
             <div className="p-3.5 bg-paper rounded-xl border border-line space-y-1">

@@ -992,15 +992,23 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
     return resolveDailyUpdateBanner(selectionResolution.activePublication, latestPublishedCanonical);
   }, [selectionResolution.activePublication, latestPublishedCanonical]);
 
-  const latestPubCutoffSummary = useMemo(() => {
-    const latestItem = allPubs.length > 0 ? allPubs[allPubs.length - 1] : null;
-    if (!latestItem) return null;
-    return {
-      periodLabel: latestItem.short,
-      cutoffLabel: latestItem.cutoff,
-      isDaily: latestItem.publicationFormat === 'daily'
-    };
-  }, [allPubs]);
+  const formatOrdinalDateLabel = (label: string): string => {
+    return label.replace(/^(\d{1,2})\s+([A-Z][a-z]+\s+\d{4})$/, (_, dayStr: string, rest: string) => {
+      const day = Number(dayStr);
+      const mod100 = day % 100;
+      const suffix =
+        mod100 >= 11 && mod100 <= 13
+          ? 'th'
+          : day % 10 === 1
+          ? 'st'
+          : day % 10 === 2
+          ? 'nd'
+          : day % 10 === 3
+          ? 'rd'
+          : 'th';
+      return `${day}${suffix} ${rest}`;
+    });
+  };
 
   // State options sorted alphabetically
   const stateOpts = useMemo(() => {
@@ -1275,26 +1283,6 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
             <p className="m-0 text-sm sm:text-base lg:text-[17px] leading-relaxed text-[#3d4752] max-w-[760px]">
               Evidence-based classifications of the practical conditions for political competition across Nigeria’s 36 states and the FCT.
             </p>
-            {latestPubCutoffSummary && (
-              <div
-                aria-label="Latest published evidence review date and cut-off"
-                className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs sm:text-[13px] text-[#3d4752] pt-0.5 min-w-0"
-              >
-                <span>
-                  <strong className="text-[#1c232b] font-semibold">Latest published review:</strong>{' '}
-                  <span className="tabular-nums">{latestPubCutoffSummary.periodLabel}</span>
-                </span>
-                {latestPubCutoffSummary.cutoffLabel && (
-                  <>
-                    <span aria-hidden="true" className="text-slate-400">·</span>
-                    <span>
-                      <strong className="text-[#1c232b] font-semibold">Evidence cut-off:</strong>{' '}
-                      <span className="tabular-nums">{latestPubCutoffSummary.cutoffLabel}</span>
-                    </span>
-                  </>
-                )}
-              </div>
-            )}
             {/* Stage 5: Transparent notice when a direct URL requests an invalid/unpublished edition, unknown state, or missing date */}
             {permalinkNotice && (
               <div
@@ -1391,13 +1379,8 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
               <div className="flex justify-between items-start sm:items-center flex-wrap gap-2 min-w-0">
                 <div className="flex flex-col gap-0.5 min-w-0">
                   <h2 className="m-0 text-lg sm:text-xl font-bold text-[#1c232b] leading-snug break-words">
-                    Map as published for {activePub.short}
+                    Democratic Competitiveness Map as of {formatOrdinalDateLabel(activePub.short)}
                   </h2>
-                  {activePub.cutoff && (
-                    <span className="text-xs text-slate-600 tabular-nums break-words">
-                      Evidence cut-off: {activePub.cutoff}
-                    </span>
-                  )}
                 </div>
                 {sel && (
                   <button
@@ -1864,7 +1847,6 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
                 if (!activeTooltipState) return null;
 
                 const details = getStateDetails(activePub, prevPub, activeTooltipState.name);
-                const cutoffText = activePub.cutoff || 'Not recorded';
 
                 const containerW = mapContainerRef.current?.clientWidth || 760;
                 const containerH = mapContainerRef.current?.clientHeight || 617;
@@ -1975,7 +1957,7 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
 
                     <div style={{ marginTop: '14px', paddingTop: '10px', borderTop: '1px solid #f1f5f9', fontSize: '11px', color: '#64748b', lineHeight: 1.4 }}>
                       <div>AEO Democratic Competitiveness Map (DCM)</div>
-                      <div>{activePub.publicationFormat === 'daily' ? `Evidence cut-off: ${cutoffText}` : `Updated: ${cutoffText}`}</div>
+                      <div>As of {formatOrdinalDateLabel(activePub.short)}</div>
                     </div>
                   </div>
                 );
@@ -2042,12 +2024,6 @@ export const DcmPreview: React.FC<DcmPreviewProps> = ({ isEmbedded = false, hide
                   </h2>
                   <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-[#3d4752] tabular-nums">
                     <span className="font-semibold text-[#1c232b]">{dailyUpdateBanner.dateLabel}</span>
-                    {dailyUpdateBanner.evidenceCutoffLabel && (
-                      <>
-                        <span aria-hidden="true" className="text-slate-400">·</span>
-                        <span>Evidence cut-off: {dailyUpdateBanner.evidenceCutoffLabel}</span>
-                      </>
-                    )}
                     {dailyUpdateBanner.isQuietDay && (
                       <>
                         <span aria-hidden="true" className="text-slate-400">·</span>

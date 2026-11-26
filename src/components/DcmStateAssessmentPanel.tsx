@@ -342,10 +342,6 @@ export const DcmStateAssessmentPanel: React.FC<DcmStateAssessmentPanelProps> = (
               </span>
             </div>
           )}
-          <div className="flex items-start gap-1.5 text-[11px] text-slate-600 break-words">
-            <Clock className="w-3.5 h-3.5 shrink-0 mt-0.5" aria-hidden="true" />
-            <span>Evidence cut-off: {evidenceCutoffLabel}</span>
-          </div>
         </div>
 
         {/* Approved reason for changing or retaining classification */}
@@ -486,12 +482,6 @@ export const DcmStateAssessmentPanel: React.FC<DcmStateAssessmentPanelProps> = (
                         <span>Incident: {ev.incidentId}</span>
                       </>
                     )}
-                    {ev.approvalReference && (
-                      <>
-                        <span aria-hidden="true">·</span>
-                        <span>Approval: {ev.approvalReference}</span>
-                      </>
-                    )}
                   </div>
                 </div>
               </article>
@@ -571,7 +561,7 @@ export const DcmStateAssessmentPanel: React.FC<DcmStateAssessmentPanelProps> = (
                   <p className="text-slate-500 italic m-0 break-words">
                     {resp.received
                       ? 'Response received; no approved public summary recorded.'
-                      : 'Institutional response requested; no response received as of the evidence cut-off.'}
+                      : 'Institutional response requested; no response received yet.'}
                   </p>
                 )}
                 <div className="text-[11px] text-slate-500 break-words">
